@@ -120,6 +120,38 @@ def shared_points_to_camera_depth(points, calib, image_shape, invalid_value=-1.0
     return depth
 
 
+def shared_points_to_gdc_depth(
+    points, calib, image_shape, clip_distance=2.0, invalid_value=-1.0,
+):
+    """Apply canonical GDC FOV filtering and nearest-positive camera-z projection.
+
+    This intentionally reproduces ``get_ptc_in_image`` semantics: FOV inclusion
+    uses floating projected coordinates with exclusive ``width - 1`` and
+    ``height - 1`` upper bounds, and points require Velodyne ``x`` strictly
+    greater than ``clip_distance``. Pixel assignment remains rounded and uses
+    the nearest positive rect-camera z for collisions.
+    """
+    points = np.asarray(points, dtype=np.float32)
+    if points.size == 0:
+        return shared_points_to_camera_depth(
+            points, calib, image_shape, invalid_value=invalid_value
+        )
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError("points must have shape (N, >=3)")
+    height, width = image_shape[:2]
+    projected = calib.project_velo_to_image(points[:, :3])
+    fov = (
+        (projected[:, 0] < width - 1)
+        & (projected[:, 0] >= 0)
+        & (projected[:, 1] < height - 1)
+        & (projected[:, 1] >= 0)
+        & (points[:, 0] > float(clip_distance))
+    )
+    return shared_points_to_camera_depth(
+        points[fov], calib, image_shape, invalid_value=invalid_value
+    )
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:

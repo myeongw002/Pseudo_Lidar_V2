@@ -13,13 +13,71 @@ from range_gdc.range_projection import range_to_velo
 from src.pseudo_lidar.depth_to_range_uniform import lidar_points_to_spherical_guide_uniform
 from range_gdc.shared_canonical_anchor import (
     extract_shared_points, project_with_source_indices, shared_points_to_camera_depth,
+    shared_points_to_gdc_depth,
 )
+from ptc2depthmap import get_depth_map
 from tools import run_range_gdc_experiment as pipeline
 from tools.audit_shared_anchor_protocol import audit_frame, aggregate_audit
 from tools.run_fusion_comparison import aggregate_common_hidden_metrics
 
 
 class PaperPipelineTests(unittest.TestCase):
+    class FakeGDCCalibration:
+        def project_velo_to_image(self, points):
+            points = np.asarray(points, dtype=np.float32)
+            return points[:, [1, 2]]
+
+        def project_velo_to_rect(self, points):
+            points = np.asarray(points, dtype=np.float32)
+            return np.column_stack((points[:, 1], points[:, 2], points[:, 0]))
+
+    def test_canonical_gdc_filters_velodyne_x_at_clip_distance(self):
+        depth = shared_points_to_gdc_depth(
+            np.array([[2.0, 1.0, 1.0, 0.1]], dtype=np.float32),
+            self.FakeGDCCalibration(), (10, 10, 3),
+        )
+        self.assertFalse(np.any(depth > 0))
+
+    def test_canonical_gdc_keeps_point_beyond_clip_distance_in_fov(self):
+        depth = shared_points_to_gdc_depth(
+            np.array([[3.0, 2.0, 2.0, 0.1]], dtype=np.float32),
+            self.FakeGDCCalibration(), (10, 10, 3),
+        )
+        self.assertEqual(depth[2, 2], 3.0)
+
+    def test_canonical_gdc_filters_point_outside_float_image_fov(self):
+        depth = shared_points_to_gdc_depth(
+            np.array([[3.0, 9.0, 1.0, 0.1]], dtype=np.float32),
+            self.FakeGDCCalibration(), (10, 10, 3),
+        )
+        self.assertFalse(np.any(depth > 0))
+
+    def test_canonical_gdc_pixel_collision_keeps_nearest_positive_camera_z(self):
+        depth = shared_points_to_gdc_depth(
+            np.array([[5.0, 1.0, 1.0, 0.1], [3.0, 1.0, 1.0, 0.2]], dtype=np.float32),
+            self.FakeGDCCalibration(), (10, 10, 3),
+        )
+        self.assertEqual(depth[1, 1], 3.0)
+
+    def test_production_canonical_gdc_and_audit_helper_are_identical(self):
+        points = np.array([
+            [1.0, 1.0, 1.0, 0.1], [5.0, 1.0, 1.0, 0.2],
+            [3.0, 1.0, 1.0, 0.3], [4.0, 20.0, 1.0, 0.4],
+        ], dtype=np.float32)
+        calib = self.FakeGDCCalibration()
+        image = np.zeros((10, 10, 3), dtype=np.uint8)
+        production = get_depth_map(points, calib, image, "nearest_positive")
+        audit_expected = shared_points_to_gdc_depth(points, calib, image.shape)
+        self.assertTrue(np.array_equal(production, audit_expected))
+
+    def test_legacy_last_collision_policy_preserves_last_overwrite(self):
+        points = np.array([
+            [3.0, 1.0, 1.0, 0.1], [5.0, 1.0, 1.0, 0.2],
+        ], dtype=np.float32)
+        image = np.zeros((10, 10, 3), dtype=np.uint8)
+        depth = get_depth_map(points, self.FakeGDCCalibration(), image, "legacy_last")
+        self.assertEqual(depth[1, 1], 5.0)
+
     @staticmethod
     def shared_audit_fixture():
         points = np.array([[1.0, 0.0, 0.0, 0.1], [0.0, 2.0, 0.0, 0.2]], dtype=np.float32)
@@ -64,6 +122,9 @@ class PaperPipelineTests(unittest.TestCase):
         fixture["actual_gdc_depth"][0, 0] += 0.02
         row = audit_frame(**fixture)
         self.assertEqual(row["gdc_depth_value_mismatch_count"], 1)
+        self.assertEqual(row["gdc_both_valid_value_mismatch_count"], 1)
+        self.assertEqual(row["gdc_expected_valid_only_count"], 0)
+        self.assertEqual(row["gdc_actual_valid_only_count"], 0)
         self.assertGreater(row["gdc_depth_value_max_abs_error"], 0.019)
 
     def test_normal_shared_audit_has_zero_mismatch_counts(self):

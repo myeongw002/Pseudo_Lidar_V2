@@ -12,7 +12,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-from range_gdc.shared_canonical_anchor import sha256_file, shared_points_to_camera_depth
+from range_gdc.shared_canonical_anchor import sha256_file, shared_points_to_gdc_depth
 
 sys.path.insert(0, str(REPO_ROOT / "gdc"))
 from data_utils.kitti_util import Calibration, load_image  # noqa: E402
@@ -60,6 +60,8 @@ def _value_comparison(actual, expected, atol):
     if comparable_error.size:
         value_bad[both] = comparable_error > float(atol)
     mismatch = (actual_valid ^ expected_valid) | value_bad
+    expected_only = expected_valid & ~actual_valid
+    actual_only = actual_valid & ~expected_valid
     union_count = int((actual_valid | expected_valid).sum())
     mismatch_count = int(mismatch.sum())
     mismatched_errors = comparable_error[comparable_error > float(atol)]
@@ -68,6 +70,9 @@ def _value_comparison(actual, expected, atol):
         "expected_valid_count": int(expected_valid.sum()),
         "comparison_valid_count": union_count,
         "mismatch_count": mismatch_count,
+        "expected_valid_only_count": int(expected_only.sum()),
+        "actual_valid_only_count": int(actual_only.sum()),
+        "both_valid_value_mismatch_count": int(value_bad.sum()),
         "mismatch_ratio": _ratio(mismatch_count, union_count),
         "mae": float(np.mean(comparable_error)) if comparable_error.size else 0.0,
         "max_abs_error": float(np.max(comparable_error)) if comparable_error.size else 0.0,
@@ -159,6 +164,9 @@ def audit_frame(
         "gdc_anchor_not_from_shared_count": gdc_not_shared,
         "gdc_anchor_not_from_shared_ratio": _ratio(gdc_not_shared, gdc_compare["actual_valid_count"]),
         "gdc_depth_value_mismatch_count": gdc_compare["mismatch_count"],
+        "gdc_expected_valid_only_count": gdc_compare["expected_valid_only_count"],
+        "gdc_actual_valid_only_count": gdc_compare["actual_valid_only_count"],
+        "gdc_both_valid_value_mismatch_count": gdc_compare["both_valid_value_mismatch_count"],
         "gdc_depth_value_mismatch_ratio": gdc_compare["mismatch_ratio"],
         "gdc_depth_value_max_abs_error": gdc_compare["max_abs_error"],
     }
@@ -188,6 +196,9 @@ def aggregate_audit(rows):
         "gdc_anchor_not_from_shared_count": gdc_external,
         "gdc_anchor_not_from_shared_ratio": _ratio(gdc_external, gdc_valid),
         "gdc_depth_value_mismatch_count": gdc_value_bad,
+        "gdc_expected_valid_only_count": total("gdc_expected_valid_only_count"),
+        "gdc_actual_valid_only_count": total("gdc_actual_valid_only_count"),
+        "gdc_both_valid_value_mismatch_count": total("gdc_both_valid_value_mismatch_count"),
         "gdc_depth_value_mismatch_ratio": _ratio(gdc_value_bad, gdc_comparison),
         "gdc_depth_value_max_abs_error": max((float(row["gdc_depth_value_max_abs_error"]) for row in rows), default=0.0),
     }
@@ -258,7 +269,9 @@ def main():
         rgc = np.load(rgc_dir / f"{stem}.npy")
         calib = Calibration(str(Path(args.calib_dir) / f"{stem}.txt"))
         image = load_image(str(Path(args.image_dir) / f"{stem}.png"))
-        expected_gdc = shared_points_to_camera_depth(points, calib, image.shape)
+        expected_gdc = shared_points_to_gdc_depth(
+            points, calib, image.shape, clip_distance=2.0, invalid_value=-1.0
+        )
         actual_gdc = np.load(gdc_dir / f"{stem}.npy")
         rows.append(audit_frame(
             stem, points, source, recorded_source, rgc, actual_gdc, expected_gdc,
