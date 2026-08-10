@@ -1,0 +1,100 @@
+# Reproducible paper experiment config for three correction methods.
+# Use a new output_root. Completed stages resume; forced stages are cleaned only inside output_root.
+
+output_root: /data/kitti/pseudo_lidar_paper_fixed_rows_v1
+pipeline: both
+kitti_root: /data/kitti/kitti_object/testing
+split_file: ./split/test_100.txt
+threads: 4
+
+sdn_config: ./src/configs/sdn_kitti_train.config
+sdn_checkpoint: /data/kitti/pseudo_lidar/sdn_kitti_train_set/checkpoint.pth.tar
+data_tag: paper_fixed_rows
+sdn_workers: 4
+bval: 1
+
+# Original GDC uses a physical 4-beam point cloud projected into image depth.
+anchor:
+  mode: shared_pointcloud
+  source_ptc_path: /data/kitti/kitti_object/testing/velodyne
+  selected_lines: [5, 7, 9, 11]
+  extraction_height: 64
+  extraction_width: 1024
+  image_fov_only: true
+  threads: 4
+
+# Range GDC directly masks these fixed rows from the GT 64-row range image.
+# Evaluation excludes exactly the same rows and evaluates the remaining 60 rows.
+range_anchor:
+  mode: gt_rows
+  selected_rows: [5, 7, 9, 11]
+  threads: 4
+
+# Common rejection/force policy. Original GDC compares camera z-depth while
+# Range GDC compares spherical range, so the same numeric threshold has a
+# different coordinate domain.
+anchor_filter:
+  mode: abs
+  abs_error_thr: 2.0
+  log_ratio_thr: 0.4
+  force_policy: accepted_only
+
+original_gdc:
+  run_naive: true
+  run_optimized: true
+  k: 10
+  recon_tol: 0.0005
+  method: cg
+  consider_range: [-0.1, 3.0]
+  subsample_strategy: deterministic
+  subsample_seed: 0
+  subsample_output: preserve
+  threads: 4
+
+range_gdc:
+  output_mode: range_eval
+  projection:
+    height: 64
+    width: 1024
+    azimuth_mode: full_360_front_centered
+    vmin_deg: -24.9
+    vmax_deg: 2.0
+    image_fov_only: true
+    threads: 4
+  method: cg
+  range_min: 0.1
+  range_max: 80.0
+  lambda_anchor: 300.0
+  lambda_prior: 0.1
+  lambda_smooth: 1.0
+  neighbor: angular_grid8
+  edge_spatial_mode: angular
+  sigma_angular: 0.01
+  sigma_log_range: 0.3
+  transfer_k: 1
+  transfer_neighbor_mode: rowcol
+  direct_weight_mode: nearest
+  confidence_mode: nearest
+  sigma_conf_pixel: 2.0
+  sigma_conf_log_range: 0.05
+  confidence_power: 2.0
+  selection_mode: confidence_hard
+  confidence_high_thr: 0.8
+  confidence_low_thr: 0.2
+  delta_clip: 0.3
+  anchor_force_policy: accepted_only
+  threads: 4
+
+evaluation:
+  enabled: true
+  include_raw: true
+  include_image_gdc: true  # legacy key: includes both Original GDC variants
+  include_range_gdc: true
+  enable_leakage_check: true
+  allow_leakage: false
+  source_rows: 4
+  range_min: 0.1
+  range_max: 80.0
+
+timing:
+  enabled: true

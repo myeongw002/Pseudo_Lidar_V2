@@ -1,0 +1,34 @@
+# Legacy reproduction image matching the original README as closely as possible.
+# WARNING: this is for old GPUs only. It is not suitable for RTX 40/50-class GPUs.
+# The original repo asks for Python 3.7 + PyTorch 1.0.0 + CUDA.
+
+FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu18.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WORKDIR=/workspace/Pseudo_Lidar_V2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash build-essential ca-certificates curl git wget bzip2 \
+    libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CONDA_DIR=/opt/conda
+ENV PATH=${CONDA_DIR}/bin:${PATH}
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py37_4.12.0-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    && bash /tmp/miniconda.sh -b -p ${CONDA_DIR} \
+    && rm /tmp/miniconda.sh \
+    && conda clean -afy
+
+RUN conda install -y python=3.7 pip \
+    && conda install -y -c pytorch pytorch==1.0.0 torchvision==0.2.1 cudatoolkit=10.0 \
+    && conda clean -afy
+
+COPY requirements-legacy.txt /tmp/requirements-legacy.txt
+RUN pip install --upgrade pip==21.3.1 setuptools wheel \
+    && pip install -r /tmp/requirements-legacy.txt
+
+ENV PYTHONPATH=/workspace/Pseudo_Lidar_V2/src:/workspace/Pseudo_Lidar_V2:${PYTHONPATH}
+WORKDIR /workspace/Pseudo_Lidar_V2
+CMD ["bash"]

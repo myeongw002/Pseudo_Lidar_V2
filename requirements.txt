@@ -4,3 +4,4 @@ scipy
 tensorboardx
 tqdm
 pillow==6.2.0
+PyYAML

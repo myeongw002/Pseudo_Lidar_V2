@@ -1,0 +1,22 @@
+services:
+  plv2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pseudo-lidar-v2:cu128
+    container_name: pseudo_lidar_v2
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    working_dir: /workspace/Pseudo_Lidar_V2
+    environment:
+      - PYTHONPATH=/opt/plv2_compat:/workspace/Pseudo_Lidar_V2/src:/workspace/Pseudo_Lidar_V2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./:/workspace/Pseudo_Lidar_V2
+      - ${KITTI_DIR:-./data/KITTI}:/data/KITTI
+      - ${SCENEFLOW_DIR:-./data/SceneFlow}:/data/SceneFlow
+      - ${RESULTS_DIR:-./results}:/workspace/Pseudo_Lidar_V2/results
+    tty: true
+    stdin_open: true

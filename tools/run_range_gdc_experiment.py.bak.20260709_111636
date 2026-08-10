@@ -1,0 +1,1031 @@
+#!/usr/bin/env python3
+"""Clean stage-based Range-GDC guide evaluation runner."""
+
+import argparse
+import csv
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import yaml
+except ImportError as exc:
+    raise SystemExit("PyYAML is required. Install requirements.txt first.") from exc
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from range_gdc.range_projection import find_input_npy  # noqa: E402
+
+
+RANGE_H = 64
+RANGE_W = 1024
+VMIN_DEG = -24.9
+VMAX_DEG = 2.0
+AZIMUTH_MODE = "front_center"
+INVALID_VALUE = 0.0
+DEPTH_MIN = 0.1
+DEPTH_MAX = 80.0
+SELECTED_ROWS = [5, 7, 9, 11]
+
+CORE_STAGES = [
+    "sdn_depth",
+    "image_gdc_sparse_depth",
+    "image_gdc_depth",
+    "gt_range",
+    "range_anchor_from_gt_range",
+    "sdn_depth_to_range",
+    "image_gdc_depth_to_range",
+    "range_gdc",
+    "evaluate",
+]
+
+PREVIEW_STAGES = [
+    "preview_sdn_depth",
+    "preview_image_gdc_depth",
+    "preview_gt_range",
+    "preview_raw_sdn_range",
+    "preview_image_gdc_range",
+    "preview_range_gdc_range",
+]
+
+POINTCLOUD_STAGES = [
+    "raw_sdn_pointcloud",
+    "image_gdc_pointcloud",
+    "range_gdc_pointcloud",
+]
+
+ALIASES = {
+    "range_anchor": "range_anchor_from_gt_range",
+    "raw_sdn_range": "sdn_depth_to_range",
+    "image_gdc_range": "image_gdc_depth_to_range",
+    "range_gdc_range": "range_gdc",
+    "preview_sdn_range": "preview_raw_sdn_range",
+}
+
+
+@dataclass
+class Stage:
+    name: str
+    inputs: list
+    outputs: list
+    clean_paths: list
+    commands_fn: object
+    validate_fn: object
+    post_fn: object = None
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def split_values(values):
+    result = []
+    for value in values or []:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item:
+                result.append(item)
+    return result
+
+
+def normalize_stage_name(name):
+    return ALIASES.get(name, name)
+
+
+def read_split_ids(split_file):
+    with open(split_file) as f:
+        ids = [f"{int(line.strip()):06d}" for line in f if line.strip()]
+    if not ids:
+        raise ValueError(f"No frame ids in split file: {split_file}")
+    return ids
+
+
+def load_yaml(path):
+    if not path:
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a mapping: {path}")
+    return data
+
+
+def resolve(path):
+    path = Path(os.path.expanduser(str(path)))
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def add_arg(cmd, flag, value):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple)):
+        if value:
+            cmd.append(flag)
+            cmd.extend(str(v) for v in value)
+        return
+    cmd.extend([flag, str(value)])
+
+
+def command_to_string(cmd):
+    return " ".join(str(part) for part in cmd)
+
+
+def path_is_under(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def safe_delete(path, output_root):
+    path = Path(path)
+    if not path.exists():
+        return
+    if not path_is_under(path, output_root):
+        raise ValueError(f"Refusing to delete path outside output_root: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def file_nonempty(path):
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+
+
+def frame_npy_exists(directory, scene_id):
+    try:
+        find_input_npy(str(directory), int(scene_id))
+        return True
+    except Exception:
+        return False
+
+
+def validate_file_count(directory, ids):
+    missing = [scene_id for scene_id in ids if not frame_npy_exists(directory, scene_id)]
+    if missing:
+        raise ValueError(f"{directory}: missing {len(missing)}/{len(ids)} files, sample={missing[:5]}")
+
+
+def load_frame_npy(directory, scene_id):
+    return np.load(find_input_npy(str(directory), int(scene_id)))
+
+
+def validate_range_dir(range_dir, ids, expected_shape=(RANGE_H, RANGE_W)):
+    validate_file_count(range_dir, ids)
+    for scene_id in ids:
+        arr = load_frame_npy(range_dir, scene_id)
+        if arr.shape != expected_shape:
+            raise ValueError(f"{range_dir}/{scene_id}: expected {expected_shape}, got {arr.shape}")
+        valid = np.isfinite(arr) & (arr > INVALID_VALUE)
+        if int(valid.sum()) <= 0:
+            raise ValueError(f"{range_dir}/{scene_id}: valid_count is zero")
+
+
+def validate_depth_dir(depth_dir, ids):
+    validate_file_count(depth_dir, ids)
+    for scene_id in ids[: min(5, len(ids))]:
+        arr = load_frame_npy(depth_dir, scene_id)
+        valid = np.isfinite(arr) & (arr > 0)
+        if int(valid.sum()) <= 0:
+            raise ValueError(f"{depth_dir}/{scene_id}: valid depth count is zero")
+
+
+def validate_anchor(anchor_dir, ids):
+    validate_range_dir(anchor_dir, ids)
+    expected = np.asarray(SELECTED_ROWS, dtype=np.int32)
+    for scene_id in ids:
+        arr = load_frame_npy(anchor_dir, scene_id)
+        valid = np.isfinite(arr) & (arr > INVALID_VALUE)
+        actual = np.where(valid.any(axis=1))[0].astype(np.int32)
+        if not np.array_equal(actual, expected):
+            raise ValueError(f"{scene_id}: expected anchor rows {expected}, got {actual}")
+        hidden = np.ones(arr.shape[0], dtype=bool)
+        hidden[expected] = False
+        if int(valid[hidden, :].sum()) != 0:
+            raise ValueError(f"{scene_id}: anchor_valid_in_hidden_rows is nonzero")
+
+
+def validate_pointcloud_dir(pc_dir, ids):
+    missing = []
+    empty = []
+    for scene_id in ids:
+        path = Path(pc_dir) / f"{scene_id}.bin"
+        if not path.exists():
+            missing.append(scene_id)
+        elif path.stat().st_size <= 0:
+            empty.append(scene_id)
+    if missing:
+        raise ValueError(f"{pc_dir}: missing {len(missing)}/{len(ids)} pointclouds, sample={missing[:5]}")
+    if empty:
+        raise ValueError(f"{pc_dir}: empty pointclouds, sample={empty[:5]}")
+
+
+def read_csv_rows(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def validate_evaluation_outputs(paths):
+    for key in ("metrics_csv", "summary_csv", "leakage_csv", "leakage_summary_csv"):
+        if not file_nonempty(paths[key]):
+            raise ValueError(f"Evaluation output is missing or empty: {paths[key]}")
+    rows = read_csv_rows(paths["leakage_summary_csv"])
+    if not rows:
+        raise ValueError("Leakage summary is empty")
+    row = rows[0]
+    if str(row.get("status", "")).upper() != "OK":
+        raise ValueError(f"Leakage status is not OK: {row}")
+    if int(float(row.get("frames_with_danger", 0))) != 0:
+        raise ValueError(f"Leakage danger detected: {row}")
+    if int(float(row.get("frames_with_warning", 0))) != 0:
+        raise ValueError(f"Leakage warning detected: {row}")
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def build_context(args):
+    cfg = load_yaml(args.config)
+    output_root = resolve(args.output_root or cfg.get("output_root", "/data/kitti/pseudo_lidar_w1024"))
+    kitti_root = resolve(args.kitti_root or cfg.get("kitti_root", "/data/kitti/kitti_object/testing"))
+    split_file = resolve(args.split_file or cfg.get("split_file", "split/test.txt"))
+    if args.data_tag:
+        data_tag = args.data_tag
+    elif args.split_file:
+        data_tag = Path(split_file).stem
+    else:
+        data_tag = cfg.get("data_tag") or Path(split_file).stem
+    threads = int(args.threads or cfg.get("threads", 4))
+
+    range_cfg = cfg.get("range_gdc", {})
+    projection = range_cfg.get("projection", {})
+    if int(projection.get("width", projection.get("range_w", RANGE_W))) != RANGE_W:
+        raise ValueError("This experiment runner only supports range width 1024")
+    if int(projection.get("height", projection.get("range_h", RANGE_H))) != RANGE_H:
+        raise ValueError("This experiment runner only supports range height 64")
+
+    paths = {
+        "output_root": output_root,
+        "config_dir": output_root / "config",
+        "resolved_config": output_root / "config" / "resolved_config.yaml",
+        "manifest": output_root / "config" / "manifest.json",
+        "pipeline_summary": output_root / "config" / "pipeline_summary.json",
+        "stage_timing": output_root / "config" / "stage_timing.csv",
+        "command_log": output_root / "config" / "command_log.json",
+        "kitti_root": kitti_root,
+        "calib": kitti_root / "calib",
+        "image": kitti_root / "image_2",
+        "velodyne": kitti_root / "velodyne",
+        "split_file": split_file,
+        "sdn_depth": output_root / "sdn" / "depth_maps" / data_tag,
+        "sdn_preview": output_root / "sdn" / "preview",
+        "image_gdc_sparse_pc": output_root / "image_gdc" / "sparse_pointcloud_work",
+        "image_gdc_sparse_depth": output_root / "image_gdc" / "sparse_depth",
+        "image_gdc_corrected_depth": output_root / "image_gdc" / "corrected_depth",
+        "image_gdc_stats_dir": output_root / "image_gdc" / "stats",
+        "image_gdc_stats_csv": output_root / "image_gdc" / "stats" / "image_gdc_stats.csv",
+        "image_gdc_preview": output_root / "image_gdc" / "preview",
+        "gt_range_root": output_root / "range" / "gt",
+        "gt_range": output_root / "range" / "gt" / "G64_range",
+        "gt_mask": output_root / "range" / "gt" / "G64_mask",
+        "gt_meta": output_root / "range" / "gt" / "meta",
+        "gt_preview": output_root / "range" / "gt" / "preview",
+        "anchor_range_root": output_root / "range" / "anchor",
+        "anchor_range": output_root / "range" / "anchor" / "G64_range",
+        "anchor_mask": output_root / "range" / "anchor" / "G64_mask",
+        "anchor_meta": output_root / "range" / "anchor" / "meta",
+        "raw_sdn_range_root": output_root / "range" / "raw_sdn",
+        "raw_sdn_range": output_root / "range" / "raw_sdn" / "G64_range",
+        "raw_sdn_mask": output_root / "range" / "raw_sdn" / "G64_mask",
+        "raw_sdn_meta": output_root / "range" / "raw_sdn" / "meta",
+        "raw_sdn_preview": output_root / "range" / "raw_sdn" / "preview",
+        "image_gdc_range_root": output_root / "range" / "image_gdc",
+        "image_gdc_range": output_root / "range" / "image_gdc" / "G64_range",
+        "image_gdc_mask": output_root / "range" / "image_gdc" / "G64_mask",
+        "image_gdc_range_meta": output_root / "range" / "image_gdc" / "meta",
+        "image_gdc_range_preview": output_root / "range" / "image_gdc" / "preview",
+        "range_gdc_range_root": output_root / "range" / "range_gdc",
+        "range_gdc_range": output_root / "range" / "range_gdc" / "G64_range",
+        "range_gdc_mask": output_root / "range" / "range_gdc" / "G64_mask",
+        "range_gdc_meta": output_root / "range" / "range_gdc" / "meta",
+        "range_gdc_preview": output_root / "range" / "range_gdc" / "preview",
+        "pc_raw_sdn": output_root / "pointcloud" / "raw_sdn_64ch",
+        "pc_image_gdc": output_root / "pointcloud" / "image_gdc_64ch",
+        "pc_range_gdc": output_root / "pointcloud" / "range_gdc_64ch",
+        "metrics_dir": output_root / "metrics",
+        "metrics_csv": output_root / "metrics" / "guide_r64_metrics.csv",
+        "summary_csv": output_root / "metrics" / "guide_r64_summary.csv",
+        "leakage_csv": output_root / "metrics" / "range_gdc_leakage_check.csv",
+        "leakage_summary_csv": output_root / "metrics" / "range_gdc_leakage_summary.csv",
+        "projection_meta": output_root / "range" / "gt" / "meta" / "projection_meta.npz",
+    }
+
+    resolved = {
+        "output_root": str(output_root),
+        "kitti_root": str(kitti_root),
+        "split_file": str(split_file),
+        "data_tag": data_tag,
+        "threads": threads,
+        "range": {
+            "height": RANGE_H,
+            "width": RANGE_W,
+            "vmin_deg": VMIN_DEG,
+            "vmax_deg": VMAX_DEG,
+            "azimuth_mode": AZIMUTH_MODE,
+            "invalid_value": INVALID_VALUE,
+            "depth_min": DEPTH_MIN,
+            "depth_max": DEPTH_MAX,
+            "selected_rows": SELECTED_ROWS,
+        },
+        "sdn": {
+            "config": str(resolve(args.sdn_config or cfg.get("sdn_config", "src/configs/sdn_kitti_train.config"))),
+            "checkpoint": str(resolve(args.sdn_checkpoint or cfg.get("sdn_checkpoint", "/data/kitti/pseudo_lidar/sdn_kitti_train_set/checkpoint.pth.tar"))),
+            "save_path": str(output_root / "sdn"),
+        },
+        "image_gdc": {
+            "dense_output": True,
+            "disable_subsample": True,
+            **cfg.get("gdc", {}),
+        },
+        "range_gdc": range_cfg,
+    }
+    return {
+        "config": cfg,
+        "resolved": resolved,
+        "paths": paths,
+        "ids": read_split_ids(split_file),
+        "threads": threads,
+        "data_tag": data_tag,
+    }
+
+
+def range_projection_cmd(mode, input_path, output_root, ctx):
+    p = ctx["paths"]
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "range_gdc" / "range_projection.py"),
+        mode,
+        "--input_path",
+        str(input_path),
+        "--output_path",
+        str(output_root),
+        "--calib_path",
+        str(p["calib"]),
+        "--split_file",
+        str(p["split_file"]),
+        "--threads",
+        str(ctx["threads"]),
+        "--height",
+        str(RANGE_H),
+        "--width",
+        str(RANGE_W),
+        "--vmin_deg",
+        str(VMIN_DEG),
+        "--vmax_deg",
+        str(VMAX_DEG),
+        "--azimuth_mode",
+        AZIMUTH_MODE,
+        "--depth_min",
+        str(DEPTH_MIN),
+        "--depth_max",
+        str(DEPTH_MAX),
+        "--invalid_value",
+        str(INVALID_VALUE),
+        "--anchor_rows",
+        *[str(row) for row in SELECTED_ROWS],
+        "--meta_path",
+        str(p["projection_meta"]),
+        "--stats_csv",
+        str(Path(output_root) / "meta" / "projection_stats.csv"),
+    ]
+    if mode == "ptc-to-range":
+        cmd.extend(["--image_path", str(p["image"]), "--no-image_fov_only"])
+    return cmd
+
+
+def preview_cmd(input_path, output_path, ctx):
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "tools" / "preview_npy.py"),
+        "--input_path",
+        str(input_path),
+        "--output_path",
+        str(output_path),
+        "--split_file",
+        str(ctx["paths"]["split_file"]),
+        "--vmin",
+        str(DEPTH_MIN),
+        "--vmax",
+        str(DEPTH_MAX),
+    ]
+    if ctx["args"].preview_max_items is not None:
+        cmd.extend(["--max_items", str(ctx["args"].preview_max_items)])
+    return cmd
+
+
+def pointcloud_cmd(range_path, output_path, ctx):
+    return [
+        sys.executable,
+        str(REPO_ROOT / "range_gdc" / "range_to_pointcloud.py"),
+        "--range_path",
+        str(range_path),
+        "--output_path",
+        str(output_path),
+        "--split_file",
+        str(ctx["paths"]["split_file"]),
+        "--projection_meta_path",
+        str(ctx["paths"]["projection_meta"]),
+        "--height",
+        str(RANGE_H),
+        "--width",
+        str(RANGE_W),
+        "--vmin_deg",
+        str(VMIN_DEG),
+        "--vmax_deg",
+        str(VMAX_DEG),
+        "--range_min",
+        str(DEPTH_MIN),
+        "--range_max",
+        str(DEPTH_MAX),
+    ]
+
+
+def copy_projection_meta_to(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    src = path.parents[1] / "gt" / "meta" / "projection_meta.npz"
+    if src.exists():
+        shutil.copy2(src, path / "projection_meta.npz")
+
+
+def build_stages(ctx):
+    p = ctx["paths"]
+    c = ctx["config"]
+    gdc = c.get("gdc", {})
+    rgdc = c.get("range_gdc", {})
+    anchor = c.get("anchor", {})
+
+    def sdn_commands():
+        return [[
+            sys.executable,
+            str(REPO_ROOT / "src" / "main.py"),
+            "-c",
+            ctx["resolved"]["sdn"]["config"],
+            "--resume",
+            ctx["resolved"]["sdn"]["checkpoint"],
+            "--datapath",
+            str(p["kitti_root"]),
+            "--data_list",
+            str(p["split_file"]),
+            "--generate_depth_map",
+            "--data_tag",
+            ctx["data_tag"],
+            "--save_path",
+            str(p["output_root"] / "sdn"),
+            "--workers",
+            str(c.get("sdn_workers", ctx["threads"])),
+            "--bval",
+            str(c.get("bval", 1)),
+        ]]
+
+    def image_gdc_sparse_commands():
+        sparse = [
+            sys.executable,
+            str(REPO_ROOT / "gdc" / "sparsify.py"),
+            "--ptc_path",
+            str(anchor.get("source_ptc_path", p["velodyne"])),
+            "--output_path",
+            str(p["image_gdc_sparse_pc"]),
+            "--calib_path",
+            str(p["calib"]),
+            "--image_path",
+            str(p["image"]),
+            "--split_file",
+            str(p["split_file"]),
+            "--threads",
+            str(anchor.get("threads", ctx["threads"])),
+            "--H",
+            str(RANGE_H),
+            "--W",
+            str(RANGE_W),
+            "--slice",
+            "1",
+            "--line_spec",
+            *[str(row) for row in SELECTED_ROWS],
+        ]
+        depth = [
+            sys.executable,
+            str(REPO_ROOT / "gdc" / "ptc2depthmap.py"),
+            "--input_path",
+            str(p["image_gdc_sparse_pc"]),
+            "--output_path",
+            str(p["image_gdc_sparse_depth"]),
+            "--calib_path",
+            str(p["calib"]),
+            "--image_path",
+            str(p["image"]),
+            "--split_file",
+            str(p["split_file"]),
+            "--threads",
+            str(ctx["threads"]),
+        ]
+        return [sparse, depth]
+
+    def image_gdc_commands():
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "gdc" / "main_batch.py"),
+            "--input_path",
+            str(p["sdn_depth"]),
+            "--calib_path",
+            str(p["calib"]),
+            "--gt_depthmap_path",
+            str(p["image_gdc_sparse_depth"]),
+            "--output_path",
+            str(p["image_gdc_corrected_depth"]),
+            "--split_file",
+            str(p["split_file"]),
+            "--threads",
+            str(gdc.get("threads", ctx["threads"])),
+            "--stats_csv",
+            str(p["image_gdc_stats_csv"]),
+            "--disable_subsample",
+        ]
+        add_arg(cmd, "--k", gdc.get("k", 10))
+        add_arg(cmd, "--recon_tol", gdc.get("recon_tol", 0.0005))
+        add_arg(cmd, "--method", gdc.get("method", "cg"))
+        add_arg(cmd, "--consider_range", gdc.get("consider_range", [-0.1, 3.0]))
+        return [cmd]
+
+    def range_anchor_commands():
+        return [[
+            sys.executable,
+            str(REPO_ROOT / "range_gdc" / "make_anchor_from_gt_range.py"),
+            "--gt_range_path",
+            str(p["gt_range"]),
+            "--output_range_path",
+            str(p["anchor_range"]),
+            "--output_mask_path",
+            str(p["anchor_mask"]),
+            "--split_file",
+            str(p["split_file"]),
+            "--selected_rows",
+            *[str(row) for row in SELECTED_ROWS],
+            "--invalid_value",
+            str(INVALID_VALUE),
+            "--expected_height",
+            str(RANGE_H),
+            "--expected_width",
+            str(RANGE_W),
+            "--projection_meta_path",
+            str(p["projection_meta"]),
+            "--meta_dir",
+            str(p["anchor_meta"]),
+            "--threads",
+            str(ctx["threads"]),
+        ]]
+
+    def range_gdc_commands():
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "range_gdc" / "range_main_batch.py"),
+            "--pred_path",
+            str(p["raw_sdn_range"]),
+            "--anchor_path",
+            str(p["anchor_range"]),
+            "--output_path",
+            str(p["range_gdc_range"]),
+            "--mask_output_path",
+            str(p["range_gdc_mask"]),
+            "--projection_meta_path",
+            str(p["projection_meta"]),
+            "--stats_csv",
+            str(p["range_gdc_meta"] / "range_gdc_stats.csv"),
+            "--threads",
+            str(rgdc.get("threads", 1)),
+            "--overwrite",
+        ]
+        for name in (
+            "method",
+            "range_min",
+            "range_max",
+            "anchor_reject",
+            "log_ratio_thr",
+            "abs_error_thr",
+            "lambda_anchor",
+            "lambda_prior",
+            "lambda_smooth",
+            "neighbor",
+            "edge_spatial_mode",
+            "sigma_angular",
+            "sigma_tangent",
+            "sigma_log_range",
+            "transfer_k",
+            "transfer_neighbor_mode",
+            "direct_weight_mode",
+            "confidence_mode",
+            "sigma_conf_pixel",
+            "sigma_conf_angular",
+            "sigma_conf_log_range",
+            "confidence_power",
+            "confidence_min",
+            "confidence_max",
+            "selection_mode",
+            "confidence_high_thr",
+            "confidence_low_thr",
+            "direct_log_range_thr",
+            "graph_log_range_thr",
+            "delta_clip",
+        ):
+            if name in rgdc:
+                add_arg(cmd, "--" + name, rgdc[name])
+        if rgdc.get("force_anchor_value", True):
+            cmd.append("--force_anchor_value")
+        return [cmd]
+
+    def evaluate_commands():
+        return [[
+            sys.executable,
+            str(REPO_ROOT / "range_gdc" / "evaluate_range_metrics.py"),
+            "--split_file",
+            str(p["split_file"]),
+            "--gt_range_path",
+            str(p["gt_range"]),
+            "--guide_range_path",
+            str(p["anchor_range"]),
+            "--source_range_path",
+            str(p["raw_sdn_range"]),
+            "--metrics_csv",
+            str(p["metrics_csv"]),
+            "--summary_csv",
+            str(p["summary_csv"]),
+            "--projection_meta_path",
+            str(p["projection_meta"]),
+            "--selected_rows_dir",
+            str(p["anchor_meta"]),
+            "--range_min",
+            str(DEPTH_MIN),
+            "--range_max",
+            str(DEPTH_MAX),
+            "--expected_height",
+            str(RANGE_H),
+            "--expected_width",
+            str(RANGE_W),
+            "--source_row_indices",
+            *[str(row) for row in SELECTED_ROWS],
+            "--source_rows",
+            str(len(SELECTED_ROWS)),
+            "--target_h",
+            str(RANGE_H),
+            "--method",
+            f"sdn_raw_guide={p['raw_sdn_range']}",
+            "--method",
+            f"sdn_image_gdc={p['image_gdc_range']}",
+            "--method",
+            f"sdn_range_gdc={p['range_gdc_range']}",
+            "--enable_leakage_check",
+            "--anchor_range_path",
+            str(p["anchor_range"]),
+            "--leakage_method",
+            "sdn_range_gdc",
+            "--leakage_output_csv",
+            str(p["leakage_csv"]),
+            "--leakage_summary_csv",
+            str(p["leakage_summary_csv"]),
+        ]]
+
+    stages = [
+        Stage("sdn_depth", [p["split_file"]], [p["sdn_depth"]], [p["sdn_depth"]], sdn_commands, lambda ids: validate_depth_dir(p["sdn_depth"], ids)),
+        Stage("image_gdc_sparse_depth", [p["velodyne"]], [p["image_gdc_sparse_depth"]], [p["image_gdc_sparse_depth"], p["image_gdc_sparse_pc"]], image_gdc_sparse_commands, lambda ids: validate_depth_dir(p["image_gdc_sparse_depth"], ids)),
+        Stage("image_gdc_depth", [p["sdn_depth"], p["image_gdc_sparse_depth"]], [p["image_gdc_corrected_depth"], p["image_gdc_stats_csv"]], [p["image_gdc_corrected_depth"], p["image_gdc_stats_dir"]], image_gdc_commands, lambda ids: (validate_depth_dir(p["image_gdc_corrected_depth"], ids), file_nonempty(p["image_gdc_stats_csv"]) or (_ for _ in ()).throw(ValueError("missing image GDC stats")))),
+        Stage("gt_range", [p["velodyne"]], [p["gt_range"], p["gt_mask"], p["gt_meta"]], [p["gt_range_root"]], lambda: [range_projection_cmd("ptc-to-range", p["velodyne"], p["gt_range_root"], ctx)], lambda ids: validate_range_dir(p["gt_range"], ids)),
+        Stage("range_anchor_from_gt_range", [p["gt_range"]], [p["anchor_range"], p["anchor_mask"], p["anchor_meta"]], [p["anchor_range_root"]], range_anchor_commands, lambda ids: validate_anchor(p["anchor_range"], ids)),
+        Stage("sdn_depth_to_range", [p["sdn_depth"]], [p["raw_sdn_range"], p["raw_sdn_mask"], p["raw_sdn_meta"]], [p["raw_sdn_range_root"]], lambda: [range_projection_cmd("depth-to-range", p["sdn_depth"], p["raw_sdn_range_root"], ctx)], lambda ids: validate_range_dir(p["raw_sdn_range"], ids)),
+        Stage("image_gdc_depth_to_range", [p["image_gdc_corrected_depth"]], [p["image_gdc_range"], p["image_gdc_mask"], p["image_gdc_range_meta"]], [p["image_gdc_range_root"]], lambda: [range_projection_cmd("depth-to-range", p["image_gdc_corrected_depth"], p["image_gdc_range_root"], ctx)], lambda ids: validate_range_dir(p["image_gdc_range"], ids)),
+        Stage("range_gdc", [p["raw_sdn_range"], p["anchor_range"]], [p["range_gdc_range"], p["range_gdc_mask"], p["range_gdc_meta"]], [p["range_gdc_range_root"]], range_gdc_commands, lambda ids: validate_range_dir(p["range_gdc_range"], ids), lambda: copy_projection_meta_to(p["range_gdc_meta"])),
+        Stage("evaluate", [p["gt_range"], p["anchor_range"], p["raw_sdn_range"], p["image_gdc_range"], p["range_gdc_range"]], [p["metrics_csv"], p["summary_csv"], p["leakage_csv"], p["leakage_summary_csv"]], [p["metrics_dir"]], evaluate_commands, lambda ids: validate_evaluation_outputs(p)),
+    ]
+
+    preview_specs = [
+        ("preview_sdn_depth", p["sdn_depth"], p["sdn_preview"]),
+        ("preview_image_gdc_depth", p["image_gdc_corrected_depth"], p["image_gdc_preview"]),
+        ("preview_gt_range", p["gt_range"], p["gt_preview"]),
+        ("preview_raw_sdn_range", p["raw_sdn_range"], p["raw_sdn_preview"]),
+        ("preview_image_gdc_range", p["image_gdc_range"], p["image_gdc_range_preview"]),
+        ("preview_range_gdc_range", p["range_gdc_range"], p["range_gdc_preview"]),
+    ]
+    for name, input_path, output_path in preview_specs:
+        stages.append(
+            Stage(
+                name,
+                [input_path],
+                [output_path],
+                [output_path],
+                lambda input_path=input_path, output_path=output_path: [preview_cmd(input_path, output_path, ctx)],
+                lambda ids, output_path=output_path: None if Path(output_path).exists() else (_ for _ in ()).throw(ValueError(f"missing preview dir {output_path}")),
+            )
+        )
+
+    pc_specs = [
+        ("raw_sdn_pointcloud", p["raw_sdn_range"], p["pc_raw_sdn"]),
+        ("image_gdc_pointcloud", p["image_gdc_range"], p["pc_image_gdc"]),
+        ("range_gdc_pointcloud", p["range_gdc_range"], p["pc_range_gdc"]),
+    ]
+    for name, input_path, output_path in pc_specs:
+        stages.append(
+            Stage(
+                name,
+                [input_path],
+                [output_path],
+                [output_path],
+                lambda input_path=input_path, output_path=output_path: [pointcloud_cmd(input_path, output_path, ctx)],
+                lambda ids, output_path=output_path: validate_pointcloud_dir(output_path, ids),
+            )
+        )
+    return {stage.name: stage for stage in stages}
+
+
+def ordered_stage_names(args):
+    order = CORE_STAGES[:]
+    if args.make_preview:
+        order = [
+            "sdn_depth",
+            "preview_sdn_depth",
+            "image_gdc_sparse_depth",
+            "image_gdc_depth",
+            "preview_image_gdc_depth",
+            "gt_range",
+            "preview_gt_range",
+            "range_anchor_from_gt_range",
+            "sdn_depth_to_range",
+            "preview_raw_sdn_range",
+            "image_gdc_depth_to_range",
+            "preview_image_gdc_range",
+            "range_gdc",
+            "preview_range_gdc_range",
+            "evaluate",
+        ]
+    if args.export_pointcloud:
+        insert_at = order.index("evaluate")
+        for stage in POINTCLOUD_STAGES:
+            if stage not in order:
+                order.insert(insert_at, stage)
+                insert_at += 1
+    return order
+
+
+def select_stages(args, order):
+    selected = order[:]
+    if args.only_stage:
+        selected = [normalize_stage_name(args.only_stage)]
+    if args.stages:
+        selected = [normalize_stage_name(name) for name in split_values([args.stages])]
+    if args.from_stage:
+        start = order.index(normalize_stage_name(args.from_stage))
+        selected = [name for name in selected if order.index(name) >= start]
+    if args.to_stage:
+        end = order.index(normalize_stage_name(args.to_stage))
+        selected = [name for name in selected if order.index(name) <= end]
+    skip = {normalize_stage_name(name) for name in split_values(args.skip_stage)}
+    return [name for name in selected if name not in skip]
+
+
+def stage_complete(stage, ids):
+    try:
+        stage.validate_fn(ids)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def run_stage(stage, ids, force, dry_run, output_root):
+    complete, reason = stage_complete(stage, ids)
+    action = "skip" if complete else "run"
+    if force:
+        action = "force_run"
+    commands = stage.commands_fn()
+
+    print(f"\n[{stage.name}]")
+    print(f"inputs : {', '.join(str(p) for p in stage.inputs)}")
+    print(f"outputs: {', '.join(str(p) for p in stage.outputs)}")
+    if reason and action != "skip":
+        print(f"status : incomplete ({reason})")
+    for cmd in commands:
+        print("command:", command_to_string(cmd))
+    print(f"action : {'dry-run ' + action if dry_run else action}")
+
+    started = now_iso()
+    perf = time.perf_counter()
+    result = {
+        "stage": stage.name,
+        "action": action,
+        "started_at": started,
+        "input_paths": [str(p) for p in stage.inputs],
+        "output_paths": [str(p) for p in stage.outputs],
+        "commands": commands,
+        "complete_before": complete,
+        "validation_before": reason,
+    }
+    try:
+        if not dry_run and action != "skip":
+            for path in stage.clean_paths:
+                safe_delete(path, output_root)
+            for cmd in commands:
+                subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+            if stage.post_fn is not None:
+                stage.post_fn()
+            stage.validate_fn(ids)
+        result["ended_at"] = now_iso()
+        result["duration_sec"] = round(time.perf_counter() - perf, 6)
+        return result
+    except Exception as exc:
+        result["action"] = "failed"
+        result["ended_at"] = now_iso()
+        result["duration_sec"] = round(time.perf_counter() - perf, 6)
+        result["error"] = str(exc)
+        raise
+    finally:
+        if "ended_at" not in result:
+            result["ended_at"] = now_iso()
+            result["duration_sec"] = round(time.perf_counter() - perf, 6)
+
+
+def write_csv(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "stage",
+        "action",
+        "started_at",
+        "ended_at",
+        "duration_sec",
+        "input_paths",
+        "output_paths",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "stage": row.get("stage"),
+                    "action": row.get("action"),
+                    "started_at": row.get("started_at"),
+                    "ended_at": row.get("ended_at"),
+                    "duration_sec": row.get("duration_sec"),
+                    "input_paths": json.dumps(row.get("input_paths", [])),
+                    "output_paths": json.dumps(row.get("output_paths", [])),
+                }
+            )
+
+
+def write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def write_run_artifacts(ctx, selected, results, dry_run):
+    p = ctx["paths"]
+    if dry_run:
+        return
+    p["config_dir"].mkdir(parents=True, exist_ok=True)
+    with open(p["resolved_config"], "w") as f:
+        yaml.safe_dump(ctx["resolved"], f, sort_keys=False)
+    write_csv(p["stage_timing"], results)
+    write_json(p["command_log"], results)
+    manifest = {
+        "run_root": str(p["output_root"]),
+        "split_file": str(p["split_file"]),
+        "frame_count": len(ctx["ids"]),
+        "selected_rows": SELECTED_ROWS,
+        "range_h": RANGE_H,
+        "range_w": RANGE_W,
+        "projection": {
+            "vmin_deg": VMIN_DEG,
+            "vmax_deg": VMAX_DEG,
+            "azimuth_mode": AZIMUTH_MODE,
+            "invalid_value": INVALID_VALUE,
+            "depth_min": DEPTH_MIN,
+            "depth_max": DEPTH_MAX,
+        },
+        "stage_list": selected,
+        "git_commit": git_commit(),
+        "created_artifacts": {key: str(value) for key, value in p.items() if path_is_under(value, p["output_root"])},
+    }
+    write_json(p["manifest"], manifest)
+    write_json(p["pipeline_summary"], {"manifest": manifest, "stages": results})
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/r64_pipeline_example.yaml")
+    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--kitti-root", default=None)
+    parser.add_argument("--split-file", default=None)
+    parser.add_argument("--data-tag", default=None)
+    parser.add_argument("--sdn-config", default=None)
+    parser.add_argument("--sdn-checkpoint", default=None)
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--stages", default=None)
+    parser.add_argument("--from-stage", default=None)
+    parser.add_argument("--to-stage", default=None)
+    parser.add_argument("--only-stage", default=None)
+    parser.add_argument("--skip-stage", action="append", default=[])
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-stage", action="append", default=[])
+    parser.add_argument("--force-from", default=None)
+    parser.add_argument("--clean-stage", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--make-preview", action="store_true")
+    parser.add_argument("--preview-max-items", type=int, default=100)
+    parser.add_argument("--export-pointcloud", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ctx = build_context(args)
+    ctx["args"] = args
+    stages = build_stages(ctx)
+    order = ordered_stage_names(args)
+    selected = select_stages(args, order)
+    for name in selected:
+        if name not in stages:
+            raise ValueError(f"Unknown stage: {name}")
+
+    if args.clean_stage:
+        name = normalize_stage_name(args.clean_stage)
+        if name not in stages:
+            raise ValueError(f"Unknown stage: {name}")
+        print(f"Cleaning stage: {name}")
+        for path in stages[name].clean_paths:
+            print(f"delete: {path}")
+            if not args.dry_run:
+                safe_delete(path, ctx["paths"]["output_root"])
+        return
+
+    force_set = {normalize_stage_name(name) for name in split_values(args.force_stage)}
+    if args.force:
+        force_set.update(selected)
+    if args.force_from:
+        start = order.index(normalize_stage_name(args.force_from))
+        force_set.update(name for name in order[start:] if name in selected)
+
+    print("Clean Range-GDC experiment")
+    print(f"output_root: {ctx['paths']['output_root']}")
+    print(f"frames     : {len(ctx['ids'])}")
+    print(f"stages     : {', '.join(selected)}")
+    print(f"dry_run    : {args.dry_run}")
+
+    results = []
+    try:
+        for name in selected:
+            result = run_stage(
+                stages[name],
+                ctx["ids"],
+                force=(name in force_set or not args.resume),
+                dry_run=args.dry_run,
+                output_root=ctx["paths"]["output_root"],
+            )
+            results.append(result)
+    finally:
+        write_run_artifacts(ctx, selected, results, args.dry_run)
+
+    print("\nDone.")
+    if not args.dry_run:
+        print(f"manifest     : {ctx['paths']['manifest']}")
+        print(f"stage_timing : {ctx['paths']['stage_timing']}")
+        print(f"command_log  : {ctx['paths']['command_log']}")
+
+
+if __name__ == "__main__":
+    main()

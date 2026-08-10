@@ -1,0 +1,8 @@
+ConfigArgParse==1.7.1
+opencv-python-headless==4.10.0.84
+scipy==1.13.1
+tensorboardX==2.6.2.2
+tqdm==4.66.5
+Pillow==10.4.0
+matplotlib==3.9.2
+numpy==1.26.4

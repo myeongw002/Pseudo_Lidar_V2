@@ -6,6 +6,10 @@ This paper has been accpeted by International Conference on Learning Representat
 by [Yurong You*](http://yurongyou.com/), [Yan Wang*](https://www.cs.cornell.edu/~yanwang/) [Wei-Lun Chao*](http://www-scf.usc.edu/~weilunc/), [Divyansh Garg](http://divyanshgarg.com/), [Bharath Hariharan](http://home.bharathh.info/), [Mark Campbell](https://campbell.mae.cornell.edu/) and [Kilian Q. Weinberger](http://kilian.cs.cornell.edu/)
 
 ![Figure](figures/whole_model.png)
+
+For the reproducible shared-anchor comparison of Original GDC naive, Original
+GDC optimized, and Range GDC, see
+[docs/paper_gdc_experiment.md](docs/paper_gdc_experiment.md).
 ### Citation
 ```
 @inproceedings{you2020pseudo,

@@ -1,14 +1,15 @@
 import argparse
+import hashlib
+import json
+import os
 import os.path as osp
-import time
 
 import numpy as np
-import torch
 from tqdm.auto import tqdm
 
 from data_utils.kitti_object import *
 from data_utils.kitti_util import rotz, Calibration, load_image, load_velo_scan
-from multiprocessing import Process, Queue, Pool
+from multiprocessing import Pool
 
 def pto_ang_map(velo_points, H=64, W=512, slice=1, line_spec=None,
                 get_lines=False, fill_in_line=None, fill_in_spec=None,
@@ -67,13 +68,16 @@ def pto_ang_map(velo_points, H=64, W=512, slice=1, line_spec=None,
 
 def gen_sparse_points(data_idx, args):
     calib = Calibration(osp.join(args.calib_path, "{:06d}.txt".format(data_idx)))
-    pc_velo = load_velo_scan(osp.join(args.ptc_path, "{:06d}.bin".format(data_idx)))
+    source_path = osp.join(args.ptc_path, "{:06d}.bin".format(data_idx))
+    pc_velo = load_velo_scan(source_path)
+    input_count = int(pc_velo.shape[0])
     img = load_image(osp.join(args.image_path, "{:06d}.png".format(data_idx)))
     img_height, img_width, img_channel = img.shape
 
-    _, _, valid_inds_fov = get_lidar_in_image_fov(
-        pc_velo[:, :3], calib, 0, 0, img_width, img_height, True)
-    pc_velo = pc_velo[valid_inds_fov]
+    if args.image_fov_only:
+        _, _, valid_inds_fov = get_lidar_in_image_fov(
+            pc_velo[:, :3], calib, 0, 0, img_width, img_height, True)
+        pc_velo = pc_velo[valid_inds_fov]
 
     valid_inds = (pc_velo[:, 0] < 120) & \
                  (pc_velo[:, 0] >= 0) & \
@@ -95,18 +99,32 @@ def gen_sparse_points(data_idx, args):
                     fill_in_slice=args.fill_in_slice)
         np.save(osp.join(args.store_line_map_dir,
                             "{:06d}".format(data_idx)), depth_map_lines)
-        return ptc
+        return ptc, input_count, source_path
     else:
-        return pto_ang_map(pc_velo, H=args.H, W=args.W, slice=args.slice,\
+        ptc = pto_ang_map(pc_velo, H=args.H, W=args.W, slice=args.slice,\
                             line_spec=args.line_spec, get_lines=False,
                             fill_in_line=fill_in_line, fill_in_spec=args.fill_in_spec,
                             fill_in_slice=args.fill_in_slice)
+        return ptc, input_count, source_path
 
 
 def sparse_and_save(args, data_idx):
-    sparse_points = gen_sparse_points(data_idx, args)
+    sparse_points, input_count, source_path = gen_sparse_points(data_idx, args)
     sparse_points = sparse_points.astype(np.float32)
-    sparse_points.tofile(args.output_path + '/' + '%06d.bin' % (data_idx))
+    output_path = args.output_path + '/' + '%06d.bin' % (data_idx)
+    sparse_points.tofile(output_path)
+    digest = hashlib.sha256()
+    with open(output_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "frame_id": f"{data_idx:06d}",
+        "source_velodyne_path": osp.abspath(source_path),
+        "input_point_count": input_count,
+        "sparse_point_count": int(sparse_points.shape[0]),
+        "output_path": osp.abspath(output_path),
+        "sha256": digest.hexdigest(),
+    }
 
 def gen_sparse_points_all(args):
     with open(args.split_file) as f:
@@ -119,20 +137,42 @@ def gen_sparse_points_all(args):
     if args.store_line_map_dir is not None and not osp.exists(args.store_line_map_dir):
         os.makedirs(args.store_line_map_dir)
 
-    pool = Pool(args.threads)
-    res = []
-    pbar = tqdm(total=len(data_idx_list))
-    def update(*a):
-        pbar.update()
-    for data_idx in data_idx_list:
-        res.append((data_idx, pool.apply_async(
-            sparse_and_save, args=(args, data_idx),
-            callback=update)))
-
-    pool.close()
-    pool.join()
-    pbar.clear(nolock=False)
-    pbar.close()
+    tasks = [(args, data_idx) for data_idx in data_idx_list]
+    if args.threads <= 1:
+        frames = [sparse_and_save(*task) for task in tqdm(tasks)]
+    else:
+        with Pool(args.threads) as pool:
+            frames = list(tqdm(pool.starmap(sparse_and_save, tasks), total=len(tasks)))
+    frames.sort(key=lambda item: item["frame_id"])
+    manifest_hash = hashlib.sha256(
+        "".join(item["sha256"] for item in frames).encode("ascii")
+    ).hexdigest()
+    provenance_path = args.provenance_json or osp.join(
+        osp.dirname(osp.normpath(args.output_path)), "provenance.json"
+    )
+    payload = {
+        "schema_version": "shared_sparse_anchor_v1",
+        "source_velodyne_dir": osp.abspath(args.ptc_path),
+        "selected_line_indices": args.line_spec,
+        "extraction_height": int(args.H),
+        "extraction_width": int(args.W),
+        "angular_extraction": {
+            "vertical_step_deg": float(0.4 * 64.0 / args.H),
+            "horizontal_span_deg": 90.0,
+            "horizontal_step_deg": float(90.0 / args.W),
+            "slice": int(args.slice),
+        },
+        "image_fov_only": bool(args.image_fov_only),
+        "output_directory": osp.abspath(args.output_path),
+        "frame_count": len(frames),
+        "manifest_sha256": manifest_hash,
+        "frames": frames,
+    }
+    parent = osp.dirname(provenance_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(provenance_path, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 if __name__ == '__main__':
@@ -157,6 +197,8 @@ if __name__ == '__main__':
     parser.add_argument('--fill_in_slice', type=int, default=None)
     parser.add_argument('--split_file', type=str)
     parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--image_fov_only', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--provenance_json', default=None)
     args = parser.parse_args()
 
     gen_sparse_points_all(args)

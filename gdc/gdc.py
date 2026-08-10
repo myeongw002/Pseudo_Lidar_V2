@@ -6,7 +6,10 @@ Author: Yurong You
 Date: Feb 2020
 '''
 
-from pykdtree.kdtree import KDTree
+try:
+    from pykdtree.kdtree import KDTree
+except ImportError:  # SciPy is already required by GDC; keep pykdtree optional.
+    from scipy.spatial import cKDTree as KDTree
 from scipy.sparse.linalg import LinearOperator
 from scipy.sparse.linalg import gmres, cg
 from scipy.sparse import eye as seye
@@ -37,9 +40,18 @@ GRID_SIZE = 0.1
 index_field_sample = np.full(
     (35, int(80 / 0.1), int(80 / 0.1)), -1, dtype=np.int32)
 
-def subsample_mask_by_grid(pc_rect):
+def subsample_mask_by_grid(pc_rect, strategy="legacy_random", seed=None):
     N = pc_rect.shape[0]
-    perm = np.random.permutation(pc_rect.shape[0])
+    if strategy == "legacy_random":
+        perm = np.random.permutation(N)
+    elif strategy == "seeded_random":
+        perm = np.random.default_rng(seed).permutation(N)
+    elif strategy == "deterministic":
+        perm = np.arange(N, dtype=np.int64)
+    else:
+        raise ValueError(
+            "subsample_strategy must be legacy_random, seeded_random, or deterministic"
+        )
     pc_rect = pc_rect[perm]
 
     range_filter = filter_mask(pc_rect)
@@ -54,9 +66,37 @@ def subsample_mask_by_grid(pc_rect):
 
     index_field[pc_rect_quantized[:, 1],
                 pc_rect_quantized[:, 2], pc_rect_quantized[:, 0]] = np.arange(pc_rect.shape[0])
-    mask = np.zeros(perm.shape, dtype=np.bool)
+    mask = np.zeros(perm.shape, dtype=bool)
     mask[perm[range_filter][index_field[index_field >= 0]]] = 1
     return mask
+
+
+def anchor_accept_mask(pred_depth, anchor_depth, candidate_mask, mode="abs",
+                       abs_error_thr=2.0, log_ratio_thr=0.4):
+    """Apply the shared strict anchor policy in camera z-depth space.
+
+    A value exactly on the threshold is rejected, preserving Original GDC's
+    historical ``abs(pred-anchor) < 2`` boundary behavior.
+    """
+    if mode not in {"none", "abs", "log_ratio"}:
+        raise ValueError("anchor_reject must be one of none, abs, log_ratio")
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    accepted = candidate_mask.copy()
+    if mode == "none" or not np.any(candidate_mask):
+        return accepted
+    if mode == "abs":
+        accepted[candidate_mask] &= (
+            np.abs(pred_depth[candidate_mask] - anchor_depth[candidate_mask])
+            < float(abs_error_thr)
+        )
+    else:
+        eps = 1e-6
+        diff = np.abs(
+            np.log(np.maximum(pred_depth[candidate_mask], eps))
+            - np.log(np.maximum(anchor_depth[candidate_mask], eps))
+        )
+        accepted[candidate_mask] &= diff < float(log_ratio_thr)
+    return accepted
 
 
 def filter_theta_mask(pc_rect, low, high):
@@ -86,6 +126,14 @@ def GDC(pred_depth, gt_depth, calib,
         method='gmres',
         consider_range=(-0.1, 3.0),
         subsample=False,
+        subsample_strategy="legacy_random",
+        subsample_seed=None,
+        anchor_reject="abs",
+        abs_error_thr=2.0,
+        log_ratio_thr=0.4,
+        anchor_force_policy="accepted_only",
+        subsample_output="preserve",
+        return_stats=False,
         ):
     """
     Returns the depth map after Graph-based Depth Correction (GDC).
@@ -102,11 +150,22 @@ def GDC(pred_depth, gt_depth, calib,
         method - use cg or gmres to solve the second step
         consider_range - perform LLDC only on points whose pitch angles are
             within this range
-        subsample - whether subsampling points by grids
+        subsample - whether subsampling points by 0.1 m grids
+        anchor_force_policy - which sparse anchors are copied to the final
+            output: accepted_only, all_valid, or none
+        subsample_output - preserve keeps unprocessed prediction pixels;
+            sparse reproduces the legacy sparse-only optimized output
 
     Returns:
         new_depth_map - A refined depthmap with the same size of pred_depth
     """
+
+    if anchor_force_policy not in {"accepted_only", "all_valid", "none"}:
+        raise ValueError(
+            "anchor_force_policy must be accepted_only, all_valid, or none"
+        )
+    if subsample_output not in {"preserve", "sparse"}:
+        raise ValueError("subsample_output must be preserve or sparse")
 
     if verbose:
         print("warpping up depth infos...")
@@ -117,17 +176,23 @@ def GDC(pred_depth, gt_depth, calib,
         high=np.radians(consider_range[1]))).reshape(pred_depth.shape)
     if subsample:
         subsample_mask = subsample_mask_by_grid(
-            ptc).reshape(pred_depth.shape)
+            ptc, strategy=subsample_strategy, seed=subsample_seed
+        ).reshape(pred_depth.shape)
         consider_PL = consider_PL * subsample_mask
 
 
     consider_L = filter_mask(depth2ptc(gt_depth, calib)
                              ).reshape(gt_depth.shape)
-    gt_mask = consider_L * consider_PL
-
-    # We don't drastically move points.
-    # This avoids numerical issues in solving linear equations.
-    gt_mask[gt_mask] *= (np.abs(pred_depth[gt_mask] - gt_depth[gt_mask]) < 2)
+    anchor_candidate = (gt_depth > 0) & consider_L
+    anchor_overlap = anchor_candidate & consider_PL
+    gt_mask = anchor_accept_mask(
+        pred_depth,
+        gt_depth,
+        anchor_overlap,
+        mode=anchor_reject,
+        abs_error_thr=abs_error_thr,
+        log_ratio_thr=log_ratio_thr,
+    )
 
     # we only consider points within certain ranges
     pred_mask = np.logical_not(gt_mask) * consider_PL
@@ -158,7 +223,7 @@ def GDC(pred_depth, gt_depth, calib,
     As[:, k, :k] = x_info[neighbors]
     As[:, :k, k] = x_info[neighbors]
 
-    W = np.linalg.solve(As, bs)[:, :k]
+    W = np.linalg.solve(As, bs[..., None])[:, :k, 0]
 
     if verbose:
         avg = 0
@@ -199,18 +264,43 @@ def GDC(pred_depth, gt_depth, calib,
     ATA = LinearOperator((A.shape[1], A.shape[1]),
                          matvec=lambda x: A.T.dot(A.dot(x)))
     method = cg if method == 'cg' else gmres
-    x_new, info = method(ATA, A.T.dot(
-        b), x0=x_info[:N_PL], tol=recon_tol)
+    try:
+        x_new, info = method(ATA, A.T.dot(b), x0=x_info[:N_PL], tol=recon_tol)
+    except TypeError:
+        x_new, info = method(ATA, A.T.dot(b), x0=x_info[:N_PL], rtol=recon_tol)
     if verbose:
         print(info)
         print('solve in error: {}'.format(np.linalg.norm(A.dot(x_new) - b)))
 
-    if subsample:
+    if subsample and subsample_output == "sparse":
         new_depth_map = np.full_like(pred_depth, -1)
         new_depth_map[subsample_mask] = pred_depth[subsample_mask]
     else:
         new_depth_map = pred_depth.copy()
     new_depth_map[pred_mask] = x_new
-    new_depth_map[gt_depth > 0] = gt_depth[gt_depth > 0]
+    if anchor_force_policy == "accepted_only":
+        force_mask = gt_mask
+    elif anchor_force_policy == "all_valid":
+        force_mask = gt_depth > 0
+    else:
+        force_mask = np.zeros_like(gt_mask, dtype=bool)
+    new_depth_map[force_mask] = gt_depth[force_mask]
 
-    return new_depth_map
+    candidate_count = int(anchor_candidate.sum())
+    overlap_count = int(anchor_overlap.sum())
+    accepted_count = int(gt_mask.sum())
+    stats = {
+        "anchor_candidate_count": candidate_count,
+        "anchor_overlap_count": overlap_count,
+        "anchor_before_reject_count": overlap_count,
+        "anchor_after_reject_count": accepted_count,
+        "anchor_reject_count": overlap_count - accepted_count,
+        "anchor_reject_ratio": (
+            (overlap_count - accepted_count) / overlap_count if overlap_count else np.nan
+        ),
+        "correction_node_count": int(N_PL + N_L),
+        "anchor_force_policy": anchor_force_policy,
+        "anchor_forced_count": int(force_mask.sum()),
+        "subsample_output": subsample_output,
+    }
+    return (new_depth_map, stats) if return_stats else new_depth_map
