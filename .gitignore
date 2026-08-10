@@ -107,3 +107,4 @@ venv.bak/
 .vscode
 .codex
 .agents
+pseudo_lidar_v2_docker/results/
