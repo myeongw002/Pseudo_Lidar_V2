@@ -3,7 +3,7 @@
 The canonical entry point is:
 
 ```bash
-python3 -B tools/run_range_gdc_experiment.py --config configs/r64_pipeline_example.yaml
+python3 -B tools/run_range_gdc_experiment.py --config configs/r64_pipeline_canonical.yaml
 ```
 
 `run_r64_pipeline.py` is obsolete and is not used by this workflow.
@@ -19,10 +19,10 @@ locations when using it.
 
 ```text
 sdn_depth
-shared_anchor_pointcloud
-shared_anchor_image_depth
+canonical_shared_anchor
+canonical_shared_anchor_image_depth
 gt_range
-range_anchor_from_gt_range
+range_anchor_from_shared_anchor
 sdn_depth_to_range
 original_gdc_naive
 original_gdc_naive_depth_to_range
@@ -32,13 +32,16 @@ range_gdc
 evaluate
 ```
 
-The two correction methods intentionally use different anchor representations:
+The two correction methods use the same canonical original-LiDAR points:
 
-- Original GDC uses a physical sparse point cloud generated once under
-  `anchor/shared_4beam_pointcloud/`, then projects it to camera z-depth under
-  `anchor/image_depth/`.
-- Range GDC directly copies the configured rows from the GT 64-row range image
-  into `anchor/range/G64_range/`.
+- Canonical projection records the nearest collision winner's original PCD index
+  for rows `[5, 7, 9, 11]`, then writes the exact original x/y/z/intensity
+  records to `anchor/shared_canonical_pointcloud/` and the full source-index
+  grid to `anchor/shared_canonical_source_index/`.
+- Original GDC projects only that point cloud to camera z-depth with nearest
+  positive camera-z collision handling.
+- Range GDC creates its anchor only from that same source-index grid and point
+  cloud; it does not copy rows from GT range.
 
 With the default config, Range GDC uses rows `[5, 7, 9, 11]`. Evaluation excludes
 exactly these four rows and evaluates the remaining 60 rows. It does not infer
@@ -48,11 +51,11 @@ excluded rows from frame-wise projected anchor occupancy.
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
+  --config configs/r64_pipeline_canonical.yaml \
   --dry-run
 
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml
+  --config configs/r64_pipeline_canonical.yaml
 ```
 
 Use a fresh `output_root` after applying this patch.
@@ -62,40 +65,41 @@ Use a fresh `output_root` after applying this patch.
 ```bash
 # Evaluation only
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
+  --config configs/r64_pipeline_canonical.yaml \
   --only-stage evaluate \
   --force-stage evaluate
 
-# Rebuild the fixed-row Range-GDC anchor and every downstream stage
+# Rebuild the shared canonical RGC anchor and every downstream stage
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
-  --force-from range_anchor_from_gt_range
+  --config configs/r64_pipeline_canonical.yaml \
+  --force-from range_anchor_from_shared_anchor
 
 # Rebuild the Original-GDC physical anchor and all later stages
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
-  --force-from shared_anchor_pointcloud
+  --config configs/r64_pipeline_canonical.yaml \
+  --force-from canonical_shared_anchor
 
 # Rerun only Range GDC and evaluation after the anchor is already correct
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
+  --config configs/r64_pipeline_canonical.yaml \
   --stages range_gdc,evaluate \
   --force
 ```
 
 `shared_anchor_range` remains accepted as a compatibility alias for
-`range_anchor_from_gt_range`, but new commands should use the canonical stage
-name.
+`range_anchor_from_shared_anchor`, but new commands should use the canonical
+stage name.
 
 ## Main outputs
 
 ```text
-anchor/shared_4beam_pointcloud/
-anchor/provenance.json
-anchor/image_depth/
-anchor/range/G64_range/
-anchor/range/G64_mask/
-anchor/range/meta/anchor_definition.json
+anchor/shared_canonical_pointcloud/
+anchor/shared_canonical_source_index/
+anchor/shared_canonical_pointcloud_provenance.json
+anchor/shared_canonical_image_depth/
+anchor/range_shared_canonical/G64_range/
+anchor/range_shared_canonical/G64_mask/
+anchor/range_shared_canonical/meta/anchor_definition.json
 original_gdc/naive/corrected_depth/
 original_gdc/optimized/corrected_depth/
 range/original_gdc_naive/G64_range/
@@ -108,19 +112,21 @@ metrics/range_gdc_leakage_summary.csv
 
 ## Fixed-row validation
 
-The `range_anchor_from_gt_range` stage is complete only when all of the following
+The `range_anchor_from_shared_anchor` stage is complete only when all of the following
 hold for every frame:
 
 - the anchor has shape `64 x 1024`;
 - valid anchor cells exist only on the configured fixed rows;
-- the anchor valid mask on those rows matches the GT valid mask;
-- anchor values equal GT range values exactly on valid cells;
+- every valid anchor cell has a valid shared source index;
+- `anchor_definition.json` references the checksum of the shared manifest;
 - each frame records the same configured row list;
-- `anchor_definition.json` reports `mode: gt_row_mask` and the expected source,
+- `anchor_definition.json` reports `mode: shared_canonical` and the expected source,
   shape, and row indices.
 
-This prevents an older point-cloud-projected anchor directory from being
-silently reused.
+Run `python3 -B tools/audit_shared_anchor_protocol.py --output-root <root>
+--split-file <split> --calib-dir <kitti>/calib --image-dir <kitti>/image_2`
+after the three anchor stages.  It requires zero RGC/GDC points outside the
+shared source set.
 
 ## Distance-bin evaluation
 
@@ -129,7 +135,7 @@ recompute and print the distance-bin summary without rerunning correction:
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_example.yaml \
+  --config configs/r64_pipeline_canonical.yaml \
   --only-stage evaluate \
   --force-stage evaluate
 ```

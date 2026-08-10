@@ -11,11 +11,68 @@ from range_gdc.range_gdc import RangeROIGDC, _apply_anchor_reject, select_residu
 from range_gdc.range_main_batch import npy_map, select_scene_ids
 from range_gdc.range_projection import range_to_velo
 from src.pseudo_lidar.depth_to_range_uniform import lidar_points_to_spherical_guide_uniform
+from range_gdc.shared_canonical_anchor import (
+    extract_shared_points, project_with_source_indices, shared_points_to_camera_depth,
+)
 from tools import run_range_gdc_experiment as pipeline
 from tools.run_fusion_comparison import aggregate_common_hidden_metrics
 
 
 class PaperPipelineTests(unittest.TestCase):
+    def test_canonical_projection_keeps_nearest_source_collision_winner(self):
+        # Same cell, deliberately reverse the nearest/farthest PCD order.
+        points = np.array([[10.0, 0.0, 0.0, 0.1], [5.0, 0.0, 0.0, 0.2]], dtype=np.float32)
+        ranges, source, count = project_with_source_indices(
+            points, range_h=4, range_w=8, vmin_deg=-10, vmax_deg=10,
+            azimuth_mode="full_360_front_centered", range_min=0.1, range_max=80.0,
+        )
+        row, col = np.argwhere(source == 1)[0]
+        self.assertEqual(count[row, col], 2)
+        self.assertEqual(source[row, col], 1)
+        self.assertEqual(ranges[row, col], 5.0)
+
+    def test_shared_pointcloud_preserves_original_records_and_deterministic_order(self):
+        points = np.array([
+            [8.0, 0.0, 0.0, 0.8], [5.0, 0.0, 0.0, 0.5], [6.0, 1.0, 0.0, 0.6],
+        ], dtype=np.float32)
+        _, source, _ = project_with_source_indices(
+            points, range_h=4, range_w=64, vmin_deg=-10, vmax_deg=10,
+            azimuth_mode="full_360_front_centered", range_min=0.1, range_max=80.0,
+        )
+        shared, indices = extract_shared_points(points, source, [1, 2])
+        self.assertTrue(np.array_equal(indices, np.sort(np.unique(indices))))
+        self.assertTrue(np.array_equal(shared, points[indices]))
+        self.assertNotIn(0, indices.tolist())  # Collision loser cannot reappear.
+
+    def test_camera_anchor_uses_nearest_positive_depth(self):
+        class Calibration:
+            def project_velo_to_image(self, points):
+                return np.column_stack((np.zeros(len(points)), np.zeros(len(points))))
+            def project_velo_to_rect(self, points):
+                return np.asarray(points, dtype=np.float32)
+        depth = shared_points_to_camera_depth(
+            np.array([[1, 0, 9, 1], [2, 0, 3, 1], [3, 0, -2, 1]], dtype=np.float32),
+            Calibration(), (2, 2, 3), invalid_value=-1,
+        )
+        self.assertEqual(depth[0, 0], 3.0)
+
+    def test_shared_canonical_range_anchor_uses_only_shared_indices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pc, indexes, out, mask, meta = (root / name for name in ("pc", "index", "out", "mask", "meta"))
+            for path in (pc, indexes): path.mkdir()
+            original = np.array([[1, 0, 1, .1]], dtype=np.float32)
+            original.tofile(pc / "000000.bin")
+            source = np.full((4, 4), -1, dtype=np.int32); source[1, 2] = 0; source[3, 1] = 1
+            np.save(indexes / "000000.npy", source)
+            args = type("Args", (), {"expected_height": 4, "expected_width": 4, "source_index_dir": str(indexes),
+                "selected_rows": [1], "shared_pointcloud_dir": str(pc), "invalid_value": 0.0,
+                "output_range_path": str(out), "output_mask_path": str(mask), "meta_dir": str(meta)})()
+            from range_gdc.make_anchor_from_gt_range import process_one_shared_canonical
+            process_one_shared_canonical(0, args)
+            anchor = np.load(out / "000000.npy")
+            self.assertAlmostEqual(float(anchor[1, 2]), np.sqrt(2), places=6)
+            self.assertFalse(np.any(anchor[[0, 2, 3]]))
     def test_canonical_runner_builds_confidence_hard_command(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -37,6 +94,28 @@ class PaperPipelineTests(unittest.TestCase):
             commands = pipeline.build_stages(context)["range_gdc"].commands_fn()[0]
             self.assertIn("--selection_mode", commands)
             self.assertEqual(commands[commands.index("--selection_mode") + 1], "confidence_hard")
+
+    def test_canonical_runner_uses_shared_anchor_stages_and_soft_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); split = root / "split.txt"; split.write_text("0\n")
+            cfg = {"output_root": str(root / "out"), "kitti_root": str(root / "kitti"), "split_file": str(split),
+                   "anchor": {"mode": "shared_canonical", "selected_rows": [1]},
+                   "range_anchor": {"mode": "shared_canonical", "selected_rows": [1]},
+                   "range_gdc": {"selection_mode": "soft", "projection": {"height": 4, "width": 8}}}
+            args = type("Args", (), {"config": "x", "threads": 1, "data_tag": None, "output_root": None, "kitti_root": None,
+                "split_file": None, "sdn_config": None, "sdn_checkpoint": None, "no_distance_eval": True})()
+            with mock.patch.object(pipeline, "load_yaml", return_value=cfg), mock.patch.object(pipeline, "read_split_ids", return_value=["000000"]), mock.patch.object(pipeline, "resolve", side_effect=lambda value: Path(value)):
+                context = pipeline.build_context(args)
+            context["args"] = args
+            stages = pipeline.build_stages(context)
+            self.assertIn("canonical_shared_anchor", stages)
+            self.assertIn("range_anchor_from_shared_anchor", stages)
+            command = stages["range_anchor_from_shared_anchor"].commands_fn()[0]
+            self.assertIn("shared_canonical", command)
+
+    def test_checked_in_canonical_config_uses_soft_fusion(self):
+        config = pipeline.load_yaml(str(Path(__file__).parents[1] / "configs" / "r64_pipeline_canonical.yaml"))
+        self.assertEqual(config["range_gdc"]["selection_mode"], "soft")
 
     def test_abs_anchor_rejection_boundary(self):
         guide = np.array([[10.0, 10.0]], dtype=np.float32)

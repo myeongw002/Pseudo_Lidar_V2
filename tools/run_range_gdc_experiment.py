@@ -41,10 +41,11 @@ SELECTED_ROWS = [5, 7, 9, 11]
 
 CORE_STAGES = [
     "sdn_depth",
-    "shared_anchor_pointcloud",
-    "shared_anchor_image_depth",
+    "canonical_shared_anchor",
+    "canonical_shared_anchor_image_depth",
     "gt_range",
-    "range_anchor_from_gt_range",
+    "range_anchor_from_shared_anchor",
+    "audit_shared_anchor_protocol",
     "sdn_depth_to_range",
     "original_gdc_naive",
     "original_gdc_naive_depth_to_range",
@@ -74,11 +75,14 @@ POINTCLOUD_STAGES = [
 
 ALIASES = {
     # Legacy stage aliases from the discarded runner layout.
-    "image_gdc_sparse_depth": "shared_anchor_image_depth",
+    "image_gdc_sparse_depth": "canonical_shared_anchor_image_depth",
+    "shared_anchor_pointcloud": "canonical_shared_anchor",
+    "shared_anchor_image_depth": "canonical_shared_anchor_image_depth",
     "image_gdc_depth": "original_gdc_naive",
     "image_gdc_depth_to_range": "original_gdc_naive_depth_to_range",
-    "range_anchor": "range_anchor_from_gt_range",
-    "shared_anchor_range": "range_anchor_from_gt_range",
+    "range_anchor": "range_anchor_from_shared_anchor",
+    "shared_anchor_range": "range_anchor_from_shared_anchor",
+    "range_anchor_from_gt_range": "range_anchor_from_shared_anchor",
     "raw_sdn_range": "sdn_depth_to_range",
     "image_gdc_range": "original_gdc_naive_depth_to_range",
     "range_gdc_range": "range_gdc",
@@ -228,29 +232,25 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def validate_shared_anchor_provenance(provenance_path, sparse_dir, ids, anchor_cfg):
+def validate_shared_anchor_provenance(provenance_path, sparse_dir, source_index_dir, ids, projection, selected_rows):
     if not file_nonempty(provenance_path):
         raise ValueError(f"Missing shared-anchor provenance: {provenance_path}")
     with open(provenance_path) as f:
         provenance = json.load(f)
 
-    expected_lines = [int(v) for v in anchor_cfg.get("selected_lines", SELECTED_ROWS)]
-    expected_h = int(anchor_cfg.get("extraction_height", RANGE_H))
-    expected_w = int(anchor_cfg.get("extraction_width", RANGE_W))
-    expected_fov = bool(anchor_cfg.get("image_fov_only", True))
     errors = []
     if int(provenance.get("frame_count", -1)) != len(ids):
         errors.append(f"frame_count={provenance.get('frame_count')} expected={len(ids)}")
-    if [int(v) for v in provenance.get("selected_line_indices", [])] != expected_lines:
-        errors.append("selected_line_indices mismatch")
-    if int(provenance.get("extraction_height", -1)) != expected_h:
-        errors.append("extraction_height mismatch")
-    if int(provenance.get("extraction_width", -1)) != expected_w:
-        errors.append("extraction_width mismatch")
-    if bool(provenance.get("image_fov_only", False)) != expected_fov:
-        errors.append("image_fov_only mismatch")
-    if Path(provenance.get("output_directory", "")).resolve() != Path(sparse_dir).resolve():
-        errors.append("output_directory mismatch")
+    definition = provenance.get("projection_definition", provenance)
+    for name, expected in (("height", projection["height"]), ("width", projection["width"]),
+                           ("vmin_deg", projection["vmin_deg"]), ("vmax_deg", projection["vmax_deg"]),
+                           ("range_min", projection["depth_min"]), ("range_max", projection["depth_max"])):
+        if not np.isclose(float(definition.get(name, np.nan)), float(expected)):
+            errors.append(f"projection {name} mismatch")
+    if definition.get("azimuth_mode") != projection["azimuth_mode"]:
+        errors.append("projection azimuth_mode mismatch")
+    if [int(v) for v in provenance.get("selected_rows", [])] != [int(v) for v in selected_rows]:
+        errors.append("selected_rows mismatch")
 
     frame_by_id = {str(row.get("frame_id")): row for row in provenance.get("frames", [])}
     for scene_id in ids:
@@ -265,6 +265,9 @@ def validate_shared_anchor_provenance(provenance_path, sparse_dir, ids, anchor_c
         expected_sha = str(row.get("sha256", ""))
         if not expected_sha or sha256_file(output) != expected_sha:
             errors.append(f"sha256 mismatch for {scene_id}")
+        source_index = Path(source_index_dir) / f"{scene_id}.npy"
+        if not source_index.exists() or np.load(source_index).shape != (projection["height"], projection["width"]):
+            errors.append(f"missing/invalid source index for {scene_id}")
         if len(errors) >= 10:
             break
     if errors:
@@ -325,33 +328,46 @@ def validate_fixed_row_anchor(
             )
         if gt.shape != tuple(expected_shape):
             raise ValueError(f"{scene_id}: GT shape {gt.shape} != {tuple(expected_shape)}")
-
         anchor_valid = np.isfinite(anchor) & (anchor > INVALID_VALUE)
         gt_valid = np.isfinite(gt) & (gt > INVALID_VALUE)
         if int(anchor_valid.sum()) == 0:
             raise ValueError(f"{scene_id}: fixed-row anchor contains no valid cells")
         if int(anchor_valid[hidden_rows, :].sum()) != 0:
             raise ValueError(f"{scene_id}: fixed-row anchor contains hidden-row values")
-        if not np.array_equal(
-            anchor_valid[selected_rows, :], gt_valid[selected_rows, :]
-        ):
+        if not np.array_equal(anchor_valid[selected_rows, :], gt_valid[selected_rows, :]):
             raise ValueError(f"{scene_id}: fixed-row anchor valid mask differs from GT")
         selected_valid = anchor_valid[selected_rows, :]
-        if np.any(selected_valid):
-            anchor_values = anchor[selected_rows, :][selected_valid]
-            gt_values = gt[selected_rows, :][selected_valid]
-            if not np.array_equal(anchor_values, gt_values):
-                raise ValueError(f"{scene_id}: fixed-row anchor values differ from GT")
-
+        if np.any(selected_valid) and not np.array_equal(
+            anchor[selected_rows, :][selected_valid], gt[selected_rows, :][selected_valid]
+        ):
+            raise ValueError(f"{scene_id}: fixed-row anchor values differ from GT")
         selected_rows_path = Path(meta_dir) / f"{scene_id}_selected_rows.npy"
-        if not selected_rows_path.exists():
-            raise ValueError(f"Missing fixed-row metadata: {selected_rows_path}")
-        recorded_rows = np.load(selected_rows_path).astype(np.int32)
-        if not np.array_equal(recorded_rows, selected_rows):
-            raise ValueError(
-                f"{scene_id}: fixed-row metadata mismatch: "
-                f"expected={selected_rows}, recorded={recorded_rows}"
-            )
+        if not selected_rows_path.exists() or not np.array_equal(np.load(selected_rows_path), selected_rows):
+            raise ValueError(f"{scene_id}: fixed-row metadata mismatch")
+
+
+def validate_shared_canonical_range_anchor(range_dir, meta_dir, definition_path, provenance_path, ids, selected_rows, expected_shape):
+    if not file_nonempty(definition_path):
+        raise ValueError(f"Missing shared canonical anchor definition: {definition_path}")
+    with open(definition_path) as handle:
+        definition = json.load(handle)
+    if definition.get("mode") != "shared_canonical" or definition.get("anchor_source") != "shared_canonical_pointcloud":
+        raise ValueError("Range anchor is not declared as shared canonical")
+    if Path(definition.get("source_provenance_path", "")).resolve() != Path(provenance_path).resolve():
+        raise ValueError("Range anchor provenance path mismatch")
+    if definition.get("source_manifest_sha256") != sha256_file(provenance_path):
+        raise ValueError("Range anchor manifest checksum mismatch")
+    rows = np.asarray(selected_rows, dtype=np.int32)
+    for scene_id in ids:
+        anchor = load_frame_npy(range_dir, scene_id)
+        if anchor.shape != tuple(expected_shape):
+            raise ValueError(f"{scene_id}: shared range anchor shape mismatch")
+        valid = np.isfinite(anchor) & (anchor > INVALID_VALUE)
+        if np.any(valid[np.setdiff1d(np.arange(expected_shape[0]), rows), :]):
+            raise ValueError(f"{scene_id}: shared range anchor contains values outside selected rows")
+        source = np.load(Path(meta_dir) / f"{scene_id}_source_index.npy")
+        if source.shape != tuple(expected_shape) or np.any(valid & (source < 0)):
+            raise ValueError(f"{scene_id}: RGC valid cells are not from the shared source")
 
 
 def validate_pointcloud_dir(pc_dir, ids):
@@ -443,17 +459,15 @@ def build_context(args):
     threads = int(args.threads or cfg.get("threads", 4))
 
     anchor_cfg = dict(cfg.get("anchor", {}))
-    if anchor_cfg.get("mode", "shared_pointcloud") != "shared_pointcloud":
-        raise ValueError(
-            "Original GDC anchor generation requires anchor.mode=shared_pointcloud"
-        )
-    selected_lines = [int(v) for v in anchor_cfg.get("selected_lines", SELECTED_ROWS)]
+    if anchor_cfg.get("mode", "shared_canonical") not in {"shared_canonical", "shared_pointcloud"}:
+        raise ValueError("anchor.mode must be shared_canonical (shared_pointcloud is a legacy alias)")
+    selected_lines = [int(v) for v in anchor_cfg.get("selected_rows", anchor_cfg.get("selected_lines", SELECTED_ROWS))]
     if not selected_lines:
         raise ValueError("anchor.selected_lines must not be empty")
 
     range_anchor_cfg = dict(cfg.get("range_anchor", {}))
-    if range_anchor_cfg.get("mode", "gt_rows") != "gt_rows":
-        raise ValueError("Range GDC anchor generation requires range_anchor.mode=gt_rows")
+    if range_anchor_cfg.get("mode", "shared_canonical") not in {"shared_canonical", "gt_rows"}:
+        raise ValueError("range_anchor.mode must be shared_canonical (gt_rows is a legacy alias)")
     selected_rows = [
         int(v)
         for v in range_anchor_cfg.get("selected_rows", SELECTED_ROWS)
@@ -462,6 +476,8 @@ def build_context(args):
         raise ValueError("range_anchor.selected_rows must not be empty")
     if len(set(selected_rows)) != len(selected_rows):
         raise ValueError("range_anchor.selected_rows must not contain duplicates")
+    if selected_rows != selected_lines:
+        raise ValueError("anchor.selected_rows and range_anchor.selected_rows must define the same canonical source rows")
 
     range_cfg = dict(cfg.get("range_gdc", {}))
     projection_cfg = dict(range_cfg.get("projection", {}))
@@ -502,14 +518,17 @@ def build_context(args):
         "sdn_depth": output_root / "sdn" / "depth_maps" / data_tag,
         "sdn_preview": output_root / "sdn" / "preview",
         "anchor_root": output_root / "anchor",
-        "anchor_sparse_pc": output_root / "anchor" / "shared_4beam_pointcloud",
-        "anchor_provenance": output_root / "anchor" / "provenance.json",
-        "anchor_image_depth": output_root / "anchor" / "image_depth",
-        "anchor_range_root": output_root / "anchor" / "range",
-        "anchor_range": output_root / "anchor" / "range" / "G64_range",
-        "anchor_mask": output_root / "anchor" / "range" / "G64_mask",
-        "anchor_meta": output_root / "anchor" / "range" / "meta",
-        "anchor_definition": output_root / "anchor" / "range" / "meta" / "anchor_definition.json",
+        "anchor_sparse_pc": output_root / "anchor" / "shared_canonical_pointcloud",
+        "anchor_source_index": output_root / "anchor" / "shared_canonical_source_index",
+        "anchor_provenance": output_root / "anchor" / "shared_canonical_pointcloud_provenance.json",
+        "anchor_image_depth": output_root / "anchor" / "shared_canonical_image_depth",
+        "anchor_range_root": output_root / "anchor" / "range_shared_canonical",
+        "anchor_range": output_root / "anchor" / "range_shared_canonical" / "G64_range",
+        "anchor_mask": output_root / "anchor" / "range_shared_canonical" / "G64_mask",
+        "anchor_meta": output_root / "anchor" / "range_shared_canonical" / "meta",
+        "anchor_definition": output_root / "anchor" / "range_shared_canonical" / "meta" / "anchor_definition.json",
+        "shared_anchor_audit": output_root / "anchor" / "shared_canonical_protocol_audit.csv",
+        "shared_anchor_audit_summary": output_root / "anchor" / "shared_canonical_protocol_summary.csv",
         "gt_range_root": output_root / "range" / "gt",
         "gt_range": output_root / "range" / "gt" / "G64_range",
         "gt_mask": output_root / "range" / "gt" / "G64_mask",
@@ -563,7 +582,7 @@ def build_context(args):
         "data_tag": data_tag,
         "threads": threads,
         "projection": projection,
-        "anchor": {**anchor_cfg, "selected_lines": selected_lines},
+        "anchor": {**anchor_cfg, "selected_rows": selected_lines},
         "range_anchor": {**range_anchor_cfg, "selected_rows": selected_rows},
         "anchor_filter": anchor_filter,
         "original_gdc": original_cfg,
@@ -700,21 +719,21 @@ def build_stages(ctx):
 
     def shared_anchor_pointcloud_commands():
         cmd = [
-            sys.executable,
-            str(REPO_ROOT / "gdc" / "sparsify.py"),
-            "--ptc_path", str(resolve(anchor.get("source_ptc_path", p["velodyne"]))),
-            "--output_path", str(p["anchor_sparse_pc"]),
-            "--calib_path", str(p["calib"]),
-            "--image_path", str(p["image"]),
-            "--split_file", str(p["split_file"]),
-            "--threads", str(anchor.get("threads", ctx["threads"])),
-            "--H", str(anchor.get("extraction_height", projection["height"])),
-            "--W", str(anchor.get("extraction_width", projection["width"])),
-            "--slice", "1",
-            "--line_spec", *[str(row) for row in ctx["selected_lines"]],
-            "--provenance_json", str(p["anchor_provenance"]),
+            sys.executable, str(REPO_ROOT / "tools" / "create_shared_canonical_anchor.py"),
+            "--velodyne-dir", str(resolve(anchor.get("source_ptc_path", p["velodyne"]))),
+            "--split-file", str(p["split_file"]),
+            "--output-pointcloud-dir", str(p["anchor_sparse_pc"]),
+            "--output-source-index-dir", str(p["anchor_source_index"]),
+            "--provenance-json", str(p["anchor_provenance"]),
+            "--height", str(projection["height"]), "--width", str(projection["width"]),
+            "--vmin-deg", str(projection["vmin_deg"]), "--vmax-deg", str(projection["vmax_deg"]),
+            "--azimuth-mode", str(projection["azimuth_mode"]),
+            "--range-min", str(projection["depth_min"]), "--range-max", str(projection["depth_max"]),
+            "--invalid-value", str(projection["invalid_value"]),
+            "--selected-rows", *[str(row) for row in ctx["selected_rows"]],
         ]
-        cmd.append("--image_fov_only" if anchor.get("image_fov_only", True) else "--no-image_fov_only")
+        add_arg(cmd, "--azimuth-min-deg", projection.get("azimuth_min_deg"))
+        add_arg(cmd, "--azimuth-max-deg", projection.get("azimuth_max_deg"))
         return [cmd]
 
     def shared_anchor_image_depth_commands():
@@ -727,6 +746,8 @@ def build_stages(ctx):
             "--image_path", str(p["image"]),
             "--split_file", str(p["split_file"]),
             "--threads", str(anchor.get("threads", ctx["threads"])),
+            "--collision-policy", "nearest_positive",
+            "--provenance-json", str(p["anchor_provenance"]),
         ]]
 
 
@@ -734,7 +755,7 @@ def build_stages(ctx):
         return [[
             sys.executable,
             str(REPO_ROOT / "range_gdc" / "make_anchor_from_gt_range.py"),
-            "--gt_range_path", str(p["gt_range"]),
+            "--mode", "shared_canonical",
             "--output_range_path", str(p["anchor_range"]),
             "--output_mask_path", str(p["anchor_mask"]),
             "--split_file", str(p["split_file"]),
@@ -745,6 +766,18 @@ def build_stages(ctx):
             "--projection_meta_path", str(p["projection_meta"]),
             "--meta_dir", str(p["anchor_meta"]),
             "--threads", str(ctx["range_anchor_cfg"].get("threads", ctx["threads"])),
+            "--source-index-dir", str(p["anchor_source_index"]),
+            "--shared-pointcloud-dir", str(p["anchor_sparse_pc"]),
+            "--source-provenance-path", str(p["anchor_provenance"]),
+        ]]
+
+    def shared_anchor_audit_commands():
+        return [[
+            sys.executable, str(REPO_ROOT / "tools" / "audit_shared_anchor_protocol.py"),
+            "--output-root", str(p["output_root"]), "--split-file", str(p["split_file"]),
+            "--calib-dir", str(p["calib"]), "--image-dir", str(p["image"]),
+            "--output-csv", str(p["shared_anchor_audit"]),
+            "--summary-csv", str(p["shared_anchor_audit_summary"]),
         ]]
 
     def original_gdc_command(variant):
@@ -869,30 +902,40 @@ def build_stages(ctx):
     stages = [
         Stage("sdn_depth", [p["split_file"]], [p["sdn_depth"]], [p["sdn_depth"]], sdn_commands, lambda ids: validate_depth_dir(p["sdn_depth"], ids)),
         Stage(
-            "shared_anchor_pointcloud",
+            "canonical_shared_anchor",
             [resolve(anchor.get("source_ptc_path", p["velodyne"]))],
-            [p["anchor_sparse_pc"], p["anchor_provenance"]],
-            [p["anchor_sparse_pc"], p["anchor_provenance"]],
+            [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"]],
+            [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"]],
             shared_anchor_pointcloud_commands,
-            lambda ids: validate_shared_anchor_provenance(p["anchor_provenance"], p["anchor_sparse_pc"], ids, anchor),
+            lambda ids: validate_shared_anchor_provenance(p["anchor_provenance"], p["anchor_sparse_pc"], p["anchor_source_index"], ids, projection, ctx["selected_rows"]),
         ),
-        Stage("shared_anchor_image_depth", [p["anchor_sparse_pc"]], [p["anchor_image_depth"]], [p["anchor_image_depth"]], shared_anchor_image_depth_commands, lambda ids: validate_depth_dir(p["anchor_image_depth"], ids)),
+        Stage("canonical_shared_anchor_image_depth", [p["anchor_sparse_pc"], p["anchor_provenance"]], [p["anchor_image_depth"]], [p["anchor_image_depth"]], shared_anchor_image_depth_commands, lambda ids: validate_depth_dir(p["anchor_image_depth"], ids)),
         Stage("gt_range", [p["velodyne"]], [p["gt_range"], p["gt_mask"], p["gt_meta"]], [p["gt_range_root"]], lambda: [range_projection_cmd("ptc-to-range", p["velodyne"], p["gt_range_root"], ctx, image_fov_only=not ctx["args"].full_lidar_gt)], lambda ids: validate_range_dir(p["gt_range"], ids, expected_shape)),
         Stage(
-            "range_anchor_from_gt_range",
-            [p["gt_range"], p["projection_meta"]],
+            "range_anchor_from_shared_anchor",
+            [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"], p["projection_meta"]],
             [p["anchor_range"], p["anchor_mask"], p["anchor_meta"], p["anchor_definition"]],
             [p["anchor_range_root"]],
             range_anchor_from_gt_commands,
-            lambda ids: validate_fixed_row_anchor(
+            lambda ids: validate_shared_canonical_range_anchor(
                 p["anchor_range"],
                 p["anchor_meta"],
                 p["anchor_definition"],
-                p["gt_range"],
+                p["anchor_provenance"],
                 ids,
                 ctx["selected_rows"],
                 expected_shape,
             ),
+        ),
+        Stage(
+            "audit_shared_anchor_protocol",
+            [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"], p["anchor_image_depth"], p["anchor_range"]],
+            [p["shared_anchor_audit"], p["shared_anchor_audit_summary"]],
+            [p["shared_anchor_audit"], p["shared_anchor_audit_summary"]],
+            shared_anchor_audit_commands,
+            lambda ids: (
+                file_nonempty(p["shared_anchor_audit"]) and file_nonempty(p["shared_anchor_audit_summary"])
+            ) or (_ for _ in ()).throw(ValueError("missing shared-anchor audit outputs")),
         ),
         Stage("sdn_depth_to_range", [p["sdn_depth"]], [p["raw_sdn_range"], p["raw_sdn_mask"], p["raw_sdn_meta"]], [p["raw_sdn_range_root"]], lambda: [range_projection_cmd("depth-to-range", p["sdn_depth"], p["raw_sdn_range_root"], ctx)], lambda ids: validate_range_dir(p["raw_sdn_range"], ids, expected_shape)),
         Stage("original_gdc_naive", [p["sdn_depth"], p["anchor_image_depth"]], [p["original_gdc_naive_depth"], p["original_gdc_naive_stats"]], [p["original_gdc_naive_depth"], p["original_gdc_naive_stats"].parent], lambda: original_gdc_command("naive"), lambda ids: (validate_depth_dir(p["original_gdc_naive_depth"], ids), file_nonempty(p["original_gdc_naive_stats"]) or (_ for _ in ()).throw(ValueError("missing naive GDC stats")))),
@@ -938,10 +981,11 @@ def ordered_stage_names(args, ctx):
     original = ctx["original_gdc"]
     order = [
         "sdn_depth",
-        "shared_anchor_pointcloud",
-        "shared_anchor_image_depth",
+        "canonical_shared_anchor",
+        "canonical_shared_anchor_image_depth",
         "gt_range",
-        "range_anchor_from_gt_range",
+        "range_anchor_from_shared_anchor",
+        "audit_shared_anchor_protocol",
         "sdn_depth_to_range",
     ]
     if original.get("run_naive", True):
@@ -1110,7 +1154,7 @@ def write_run_artifacts(ctx, selected, results, dry_run):
         "range_h": ctx["projection"]["height"],
         "range_w": ctx["projection"]["width"],
         "projection": ctx["projection"],
-        "anchor_mode": "shared_pointcloud",
+        "anchor_mode": "shared_canonical_pointcloud",
         "anchor_provenance": str(p["anchor_provenance"]),
         "stage_list": selected,
         "git_commit": git_commit(),
@@ -1122,7 +1166,7 @@ def write_run_artifacts(ctx, selected, results, dry_run):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/r64_pipeline_example.yaml")
+    parser.add_argument("--config", default="configs/r64_pipeline_canonical.yaml")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--kitti-root", default=None)
     parser.add_argument("--split-file", default=None)

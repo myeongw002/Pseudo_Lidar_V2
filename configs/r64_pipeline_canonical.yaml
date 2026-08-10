@@ -1,0 +1,39 @@
+# Journal canonical protocol.  Use a fresh output root; historical outputs remain untouched.
+output_root: /data/kitti/pseudo_lidar_shared_canonical_v1
+kitti_root: /data/kitti/kitti_object/testing
+split_file: ./split/test_100.txt
+threads: 4
+data_tag: shared_canonical_smoke
+sdn_config: ./src/configs/sdn_kitti_train.config
+sdn_checkpoint: /data/kitti/pseudo_lidar/sdn_kitti_train_set/checkpoint.pth.tar
+
+anchor:
+  mode: shared_canonical
+  source_ptc_path: /data/kitti/kitti_object/testing/velodyne
+  selected_rows: [5, 7, 9, 11]
+  threads: 4
+range_anchor:
+  mode: shared_canonical
+  selected_rows: [5, 7, 9, 11]
+  threads: 4
+range_gdc:
+  range_min: 0.1
+  range_max: 80.0
+  selection_mode: soft
+  projection:
+    height: 64
+    width: 1024
+    vmin_deg: -24.9
+    vmax_deg: 2.0
+    azimuth_mode: full_360_front_centered
+    invalid_value: 0.0
+    image_fov_only: true
+original_gdc:
+  run_naive: true
+  run_optimized: true
+evaluation:
+  include_raw: true
+  include_image_gdc: true
+  include_range_gdc: true
+  enable_leakage_check: true
+  source_rows: 4

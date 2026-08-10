@@ -15,6 +15,11 @@ try:
 except ImportError:
     from range_projection import find_input_npy
 
+try:
+    from .shared_canonical_anchor import sha256_file
+except ImportError:
+    from shared_canonical_anchor import sha256_file
+
 
 def read_split_ids(split_file):
     with open(split_file) as f:
@@ -52,12 +57,12 @@ def copy_projection_meta(src, dst_dir, selected_rows):
 def write_anchor_definition(args, selected_rows):
     os.makedirs(args.meta_dir, exist_ok=True)
     payload = {
-        "mode": "gt_row_mask",
+        "mode": args.mode,
         "selected_rows": [int(v) for v in selected_rows.tolist()],
         "expected_height": int(args.expected_height),
         "expected_width": int(args.expected_width),
         "invalid_value": float(args.invalid_value),
-        "source_gt_range_path": osp.abspath(args.gt_range_path),
+        "source_gt_range_path": None if not args.gt_range_path else osp.abspath(args.gt_range_path),
         "split_file": osp.abspath(args.split_file),
         "projection_meta_path": (
             None
@@ -65,11 +70,24 @@ def write_anchor_definition(args, selected_rows):
             else osp.abspath(args.projection_meta_path)
         ),
     }
+    if args.mode == "shared_canonical":
+        manifest = osp.abspath(args.source_provenance_path)
+        payload.update({
+            "anchor_source": "shared_canonical_pointcloud",
+            "source_provenance_path": manifest,
+            "source_manifest_sha256": sha256_file(manifest),
+            "source_index_dir": osp.abspath(args.source_index_dir),
+            "shared_pointcloud_dir": osp.abspath(args.shared_pointcloud_dir),
+            "source_index_invalid_value": -1,
+            "point_order": "ascending_original_source_index",
+        })
     with open(osp.join(args.meta_dir, "anchor_definition.json"), "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
 def process_one(scene_id, args):
+    if getattr(args, "mode", "gt_row_mask") == "shared_canonical":
+        return process_one_shared_canonical(scene_id, args)
     gt = np.load(find_input_npy(args.gt_range_path, scene_id)).astype(np.float32)
     expected_shape = (int(args.expected_height), int(args.expected_width))
     if gt.shape != expected_shape:
@@ -99,9 +117,54 @@ def process_one(scene_id, args):
         )
 
 
+def process_one_shared_canonical(scene_id, args):
+    shape = (int(args.expected_height), int(args.expected_width))
+    stem = f"{scene_id:06d}"
+    source_index = np.load(osp.join(args.source_index_dir, f"{stem}.npy")).astype(np.int32)
+    if source_index.shape != shape:
+        raise ValueError(f"{stem}: source-index shape {source_index.shape} != {shape}")
+    rows = selected_rows_array(args.selected_rows, shape[0])
+    values = np.fromfile(osp.join(args.shared_pointcloud_dir, f"{stem}.bin"), dtype=np.float32)
+    if values.size % 4:
+        raise ValueError(f"{stem}: shared point cloud does not contain x/y/z/intensity records")
+    points = values.reshape(-1, 4)
+    selected_indices = np.unique(source_index[rows][source_index[rows] >= 0])
+    selected_indices.sort()
+    if points.shape[0] != selected_indices.size:
+        raise ValueError(
+            f"{stem}: shared PCD has {points.shape[0]} points, expected {selected_indices.size} "
+            "from selected source indices"
+        )
+    anchor = np.full(shape, float(args.invalid_value), dtype=np.float32)
+    mask = np.zeros(shape, dtype=bool)
+    if selected_indices.size:
+        source_to_range = dict(zip(
+            selected_indices.tolist(), np.linalg.norm(points[:, :3], axis=1).astype(np.float32).tolist()
+        ))
+        selected_grid = source_index[rows]
+        valid = selected_grid >= 0
+        if np.any(valid):
+            mapped = np.asarray([source_to_range.get(int(i), np.nan) for i in selected_grid[valid]], dtype=np.float32)
+            if not np.all(np.isfinite(mapped)):
+                raise ValueError(f"{stem}: RGC anchor references a source outside the shared point cloud")
+            anchor_rows = anchor[rows]
+            mask_rows = mask[rows]
+            anchor_rows[valid] = mapped
+            mask_rows[valid] = True
+            anchor[rows], mask[rows] = anchor_rows, mask_rows
+    os.makedirs(args.output_range_path, exist_ok=True)
+    os.makedirs(args.output_mask_path, exist_ok=True)
+    os.makedirs(args.meta_dir, exist_ok=True)
+    np.save(osp.join(args.output_range_path, f"{stem}.npy"), anchor)
+    np.save(osp.join(args.output_mask_path, f"{stem}.npy"), mask)
+    np.save(osp.join(args.meta_dir, f"{stem}_selected_rows.npy"), rows)
+    np.save(osp.join(args.meta_dir, f"{stem}_source_index.npy"), source_index)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gt_range_path", required=True)
+    parser.add_argument("--mode", choices=("gt_row_mask", "shared_canonical"), default="gt_row_mask")
+    parser.add_argument("--gt_range_path", default=None)
     parser.add_argument("--output_range_path", required=True)
     parser.add_argument("--output_mask_path", required=True)
     parser.add_argument("--split_file", required=True)
@@ -112,6 +175,9 @@ def parse_args():
     parser.add_argument("--projection_meta_path", default=None)
     parser.add_argument("--meta_dir", default=None)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--source-index-dir", default=None)
+    parser.add_argument("--shared-pointcloud-dir", default=None)
+    parser.add_argument("--source-provenance-path", default=None)
     return parser.parse_args()
 
 
@@ -121,6 +187,12 @@ def main():
         raise ValueError("--threads must be positive")
     if args.meta_dir is None:
         args.meta_dir = default_meta_dir(args.output_range_path)
+    if args.mode == "gt_row_mask" and not args.gt_range_path:
+        raise ValueError("--gt_range_path is required for gt_row_mask mode")
+    if args.mode == "shared_canonical":
+        for name in ("source_index_dir", "shared_pointcloud_dir", "source_provenance_path"):
+            if not getattr(args, name):
+                raise ValueError(f"--{name.replace('_', '-')} is required for shared_canonical mode")
     ids = read_split_ids(args.split_file)
     rows = selected_rows_array(args.selected_rows, args.expected_height)
     copy_projection_meta(args.projection_meta_path, args.meta_dir, rows)
