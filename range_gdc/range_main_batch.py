@@ -173,6 +173,38 @@ def discover_scene_ids(pred_path, anchor_path):
     return common, pred, anchor
 
 
+def read_split_scene_ids(split_file):
+    """Read a split as unique, zero-padded scene ids in deterministic order."""
+    with open(split_file) as handle:
+        ids = [f"{int(line.strip()):06d}" for line in handle if line.strip()]
+    if not ids:
+        raise ValueError(f"No scene ids in split file: {split_file}")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"Duplicate scene ids in split file: {split_file}")
+    return sorted(ids)
+
+
+def select_scene_ids(pred_files, anchor_files, split_file=None):
+    """Select common files, optionally requiring every id from a split."""
+    if split_file is None:
+        scene_ids = sorted(set(pred_files) & set(anchor_files))
+        if not scene_ids:
+            raise RuntimeError("No common .npy scene ids found between prediction and anchor directories")
+        return scene_ids
+
+    scene_ids = read_split_scene_ids(split_file)
+    missing_pred = [scene_id for scene_id in scene_ids if scene_id not in pred_files]
+    missing_anchor = [scene_id for scene_id in scene_ids if scene_id not in anchor_files]
+    if missing_pred or missing_anchor:
+        parts = []
+        if missing_pred:
+            parts.append(f"missing prediction frames ({len(missing_pred)}): {missing_pred[:5]}")
+        if missing_anchor:
+            parts.append(f"missing anchor frames ({len(missing_anchor)}): {missing_anchor[:5]}")
+        raise FileNotFoundError(f"Split {split_file} cannot be processed: " + "; ".join(parts))
+    return scene_ids
+
+
 def scalar_from_npz(meta, key, default=None):
     if key not in meta:
         return default
@@ -364,6 +396,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run confidence-aware residual transfer Range GDC.")
     parser.add_argument("--pred_path", "--guide_path", dest="pred_path", required=True)
     parser.add_argument("--anchor_path", required=True)
+    parser.add_argument(
+        "--split_file",
+        default=None,
+        help="Optional split restricting correction to these scene ids; every id must exist in both inputs.",
+    )
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--mask_output_path", required=True)
     parser.add_argument("--projection_meta_path", default=None)
@@ -430,6 +467,8 @@ def validate_args(args):
         path = getattr(args, path_name)
         if not osp.isdir(path):
             raise FileNotFoundError(path)
+    if args.split_file is not None and not osp.isfile(args.split_file):
+        raise FileNotFoundError(args.split_file)
     if args.threads <= 0:
         raise ValueError("--threads must be positive")
     if args.max_items is not None and args.max_items <= 0:
@@ -466,7 +505,8 @@ def main():
     args = parse_args()
     validate_args(args)
 
-    scene_ids, pred_files, anchor_files = discover_scene_ids(args.pred_path, args.anchor_path)
+    _, pred_files, anchor_files = discover_scene_ids(args.pred_path, args.anchor_path)
+    scene_ids = select_scene_ids(pred_files, anchor_files, args.split_file)
     if args.max_items is not None:
         scene_ids = scene_ids[: args.max_items]
 
