@@ -23,6 +23,7 @@ canonical_shared_anchor
 canonical_shared_anchor_image_depth
 gt_range
 range_anchor_from_shared_anchor
+audit_shared_anchor_protocol
 sdn_depth_to_range
 original_gdc_naive
 original_gdc_naive_depth_to_range
@@ -100,6 +101,8 @@ anchor/shared_canonical_image_depth/
 anchor/range_shared_canonical/G64_range/
 anchor/range_shared_canonical/G64_mask/
 anchor/range_shared_canonical/meta/anchor_definition.json
+anchor/shared_canonical_protocol_audit.csv
+anchor/shared_canonical_protocol_summary.csv
 original_gdc/naive/corrected_depth/
 original_gdc/optimized/corrected_depth/
 range/original_gdc_naive/G64_range/
@@ -125,8 +128,23 @@ hold for every frame:
 
 Run `python3 -B tools/audit_shared_anchor_protocol.py --output-root <root>
 --split-file <split> --calib-dir <kitti>/calib --image-dir <kitti>/image_2`
-after the three anchor stages.  It requires zero RGC/GDC points outside the
-shared source set.
+after the anchor stages. It re-hashes every shared PCD, checks source-index and
+point counts, and requires exact RGC/GDC validity plus values within `1e-5`.
+
+For a one-frame protocol-only smoke test, use a fresh root:
+
+```bash
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline_canonical.yaml \
+  --split-file split/test_1.txt \
+  --output-root /data/kitti/pseudo_lidar_shared_canonical_smoke \
+  --stages canonical_shared_anchor,canonical_shared_anchor_image_depth,gt_range,range_anchor_from_shared_anchor,audit_shared_anchor_protocol \
+  --no-preview \
+  --no-export-pointcloud
+```
+
+`gt_range` is included because the current RGC-anchor stage copies the canonical
+projection metadata from that stage; the audit itself does not consume GT values.
 
 ## Distance-bin evaluation
 

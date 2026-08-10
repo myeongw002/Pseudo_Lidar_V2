@@ -390,6 +390,37 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
+def validate_shared_anchor_audit_outputs(
+    audit_path, summary_path, provenance_path=None, sparse_dir=None, ids=None
+):
+    if not file_nonempty(audit_path) or not file_nonempty(summary_path):
+        raise ValueError("missing shared-anchor audit outputs")
+    summary = {row.get("metric"): row.get("value") for row in read_csv_rows(summary_path)}
+    required_zero = (
+        "shared_sparse_sha256_mismatch_count", "shared_point_count_mismatch_count",
+        "rgc_source_index_grid_mismatch_count", "rgc_anchor_not_from_shared_count",
+        "rgc_range_value_mismatch_count", "gdc_anchor_not_from_shared_count",
+        "gdc_depth_value_mismatch_count",
+    )
+    missing = [name for name in required_zero if name not in summary]
+    nonzero = [name for name in required_zero if name in summary and float(summary[name]) != 0.0]
+    if missing or nonzero:
+        raise ValueError(f"invalid shared-anchor audit summary: missing={missing}, nonzero={nonzero}")
+    if provenance_path is not None and sparse_dir is not None and ids is not None:
+        with open(provenance_path) as handle:
+            provenance = json.load(handle)
+        frame_rows = {str(row.get("frame_id")): row for row in provenance.get("frames", [])}
+        changed = []
+        for scene_id in ids:
+            frame = frame_rows.get(str(scene_id))
+            pointcloud = Path(sparse_dir) / f"{scene_id}.bin"
+            if (frame is None or not pointcloud.is_file()
+                    or frame.get("sha256") != sha256_file(pointcloud)):
+                changed.append(str(scene_id))
+        if changed:
+            raise ValueError(f"shared PCD changed since manifest/audit: sample={changed[:5]}")
+
+
 def validate_evaluation_outputs(paths, required_methods, leakage_enabled=True):
     for key in ("metrics_csv", "summary_csv"):
         if not file_nonempty(paths[key]):
@@ -933,9 +964,10 @@ def build_stages(ctx):
             [p["shared_anchor_audit"], p["shared_anchor_audit_summary"]],
             [p["shared_anchor_audit"], p["shared_anchor_audit_summary"]],
             shared_anchor_audit_commands,
-            lambda ids: (
-                file_nonempty(p["shared_anchor_audit"]) and file_nonempty(p["shared_anchor_audit_summary"])
-            ) or (_ for _ in ()).throw(ValueError("missing shared-anchor audit outputs")),
+            lambda ids: validate_shared_anchor_audit_outputs(
+                p["shared_anchor_audit"], p["shared_anchor_audit_summary"],
+                p["anchor_provenance"], p["anchor_sparse_pc"], ids,
+            ),
         ),
         Stage("sdn_depth_to_range", [p["sdn_depth"]], [p["raw_sdn_range"], p["raw_sdn_mask"], p["raw_sdn_meta"]], [p["raw_sdn_range_root"]], lambda: [range_projection_cmd("depth-to-range", p["sdn_depth"], p["raw_sdn_range_root"], ctx)], lambda ids: validate_range_dir(p["raw_sdn_range"], ids, expected_shape)),
         Stage("original_gdc_naive", [p["sdn_depth"], p["anchor_image_depth"]], [p["original_gdc_naive_depth"], p["original_gdc_naive_stats"]], [p["original_gdc_naive_depth"], p["original_gdc_naive_stats"].parent], lambda: original_gdc_command("naive"), lambda ids: (validate_depth_dir(p["original_gdc_naive_depth"], ids), file_nonempty(p["original_gdc_naive_stats"]) or (_ for _ in ()).throw(ValueError("missing naive GDC stats")))),

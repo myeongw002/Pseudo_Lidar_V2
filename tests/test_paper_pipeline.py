@@ -15,10 +15,67 @@ from range_gdc.shared_canonical_anchor import (
     extract_shared_points, project_with_source_indices, shared_points_to_camera_depth,
 )
 from tools import run_range_gdc_experiment as pipeline
+from tools.audit_shared_anchor_protocol import audit_frame, aggregate_audit
 from tools.run_fusion_comparison import aggregate_common_hidden_metrics
 
 
 class PaperPipelineTests(unittest.TestCase):
+    @staticmethod
+    def shared_audit_fixture():
+        points = np.array([[1.0, 0.0, 0.0, 0.1], [0.0, 2.0, 0.0, 0.2]], dtype=np.float32)
+        source = np.full((2, 2), -1, dtype=np.int32)
+        source[0, 0], source[0, 1] = 5, 9
+        rgc = np.array([[1.0, 2.0], [0.0, 0.0]], dtype=np.float32)
+        gdc = np.array([[3.0, -1.0]], dtype=np.float32)
+        return {
+            "frame_id": "000000", "points": points, "source_index": source,
+            "recorded_rgc_source_index": source.copy(), "rgc_anchor": rgc,
+            "actual_gdc_depth": gdc.copy(), "expected_gdc_depth": gdc,
+            "manifest_frame": {"sha256": "expected", "shared_sparse_point_count": 2},
+            "actual_shared_sha256": "expected", "selected_rows": [0],
+        }
+
+    def test_shared_audit_detects_wrong_rgc_range_value(self):
+        fixture = self.shared_audit_fixture()
+        fixture["rgc_anchor"] = fixture["rgc_anchor"].copy()
+        fixture["rgc_anchor"][0, 1] += 0.01
+        row = audit_frame(**fixture)
+        self.assertEqual(row["rgc_range_value_mismatch_count"], 1)
+        self.assertGreater(row["rgc_range_value_max_abs_error"], 0.009)
+
+    def test_shared_audit_detects_manifest_hash_mismatch(self):
+        fixture = self.shared_audit_fixture()
+        fixture["actual_shared_sha256"] = "modified-file"
+        row = audit_frame(**fixture)
+        self.assertFalse(row["shared_sparse_sha256_match"])
+        self.assertEqual(row["shared_sparse_sha256_mismatch_count"], 1)
+
+    def test_shared_audit_detects_source_index_point_count_mismatch(self):
+        fixture = self.shared_audit_fixture()
+        fixture["points"] = fixture["points"][:1]
+        row = audit_frame(**fixture)
+        self.assertEqual(row["selected_unique_source_index_count"], 2)
+        self.assertEqual(row["shared_sparse_point_count"], 1)
+        self.assertEqual(row["shared_point_count_mismatch_count"], 1)
+
+    def test_shared_audit_detects_wrong_gdc_depth_value(self):
+        fixture = self.shared_audit_fixture()
+        fixture["actual_gdc_depth"] = fixture["actual_gdc_depth"].copy()
+        fixture["actual_gdc_depth"][0, 0] += 0.02
+        row = audit_frame(**fixture)
+        self.assertEqual(row["gdc_depth_value_mismatch_count"], 1)
+        self.assertGreater(row["gdc_depth_value_max_abs_error"], 0.019)
+
+    def test_normal_shared_audit_has_zero_mismatch_counts(self):
+        row = audit_frame(**self.shared_audit_fixture())
+        summary = aggregate_audit([row])
+        for key in (
+            "shared_sparse_sha256_mismatch_count", "shared_point_count_mismatch_count",
+            "rgc_anchor_not_from_shared_count", "rgc_range_value_mismatch_count",
+            "gdc_anchor_not_from_shared_count", "gdc_depth_value_mismatch_count",
+        ):
+            self.assertEqual(summary[key], 0, key)
+
     def test_canonical_projection_keeps_nearest_source_collision_winner(self):
         # Same cell, deliberately reverse the nearest/farthest PCD order.
         points = np.array([[10.0, 0.0, 0.0, 0.1], [5.0, 0.0, 0.0, 0.2]], dtype=np.float32)
