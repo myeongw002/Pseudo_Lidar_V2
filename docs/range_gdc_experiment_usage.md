@@ -7,6 +7,13 @@ python3 -B tools/run_range_gdc_experiment.py --config configs/r64_pipeline_examp
 ```
 
 `run_r64_pipeline.py` is obsolete and is not used by this workflow.
+`tests/test_paper_pipeline.py` likewise targets this canonical runner and does
+not import the obsolete module.
+
+`tools/run_ablation.sh` remains a convenience utility rather than the canonical
+runner. It now resolves the repository path dynamically and refuses to reuse
+an existing ablation output directory; set `ROOT` and `ABLATION_ROOT` to fresh
+locations when using it.
 
 ## Core pipeline
 

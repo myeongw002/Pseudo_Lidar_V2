@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON=/usr/bin/python3
-SCRIPT=/workspace/Pseudo_Lidar_V2/range_gdc/range_main_batch.py
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PYTHON=${PYTHON:-python3}
+SCRIPT="${REPO_ROOT}/range_gdc/range_main_batch.py"
 
-ROOT=/data/kitti/pseudo_lidar_train
+ROOT=${ROOT:-/data/kitti/pseudo_lidar_train}
 PRED_PATH=${ROOT}/range/raw_sdn/G64_range
 ANCHOR_PATH=${ROOT}/anchor/range/G64_range
 PROJECTION_META=${ROOT}/range/gt/meta/projection_meta.npz
@@ -13,6 +14,12 @@ ABLATION_ROOT=${ROOT}/range/ablation
 run_ablation() {
     MODE="$1"
     OUT_ROOT="${ABLATION_ROOT}/${MODE}"
+
+    if find "${OUT_ROOT}/G64_range" -maxdepth 1 -name '*.npy' -print -quit 2>/dev/null | grep -q .; then
+        echo "Refusing to overwrite existing ablation output: ${OUT_ROOT}" >&2
+        echo "Set ABLATION_ROOT to a fresh directory for a new run." >&2
+        exit 1
+    fi
 
     mkdir -p \
         "${OUT_ROOT}/G64_range" \
@@ -33,7 +40,6 @@ run_ablation() {
         --meta_dir "${OUT_ROOT}/meta" \
         --stats_csv "${OUT_ROOT}/meta/range_gdc_stats.csv" \
         --threads 4 \
-        --overwrite \
         --ablation_mode "${MODE}" \
         --anchor_reject abs \
         --abs_error_thr 2.0 \

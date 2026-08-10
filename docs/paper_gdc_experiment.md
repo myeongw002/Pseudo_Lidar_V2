@@ -63,6 +63,36 @@ not a completion method. Its propagated variable is a log-range residual. With
 `delta_clip: 0.3`, the multiplicative correction factor is limited to
 `exp(-0.3)` through `exp(0.3)` before the configured anchor-force step.
 
+`selection_mode: confidence_hard` is the current reproducibility default.  In
+that mode, confidence at or above `confidence_high_thr` selects the direct
+proposal, confidence at or below `confidence_low_thr` selects the graph
+proposal, and values between the thresholds use a confidence-weighted blend.
+`selection_mode: soft` instead uses the Method equation for every valid direct
+proposal: `delta_final = c * delta_direct + (1-c) * delta_graph`; it falls back
+to the graph proposal only when no valid direct proposal exists.  The two modes
+must be compared under identical inputs before changing the paper default.
+
+## Phase-0 protocol audits
+
+The supplied runners intentionally reuse existing raw SDN range, fixed-row
+Range-GDC anchor, projection metadata, and GT range.  They create separate
+outputs and never change the canonical `range/range_gdc/` result directory.
+
+```bash
+python3 -B tools/run_fusion_comparison.py \
+  --config configs/r64_pipeline_test_1000.yaml
+
+python3 -B tools/audit_anchor_protocol.py \
+  --config configs/r64_pipeline_test_1000.yaml
+```
+
+The fusion runner writes `range/fusion_compare/{confidence_hard,soft}/` and
+`range/fusion_compare/fusion_comparison_summary.csv`.  The anchor audit writes
+per-frame `metrics/anchor_protocol_audit.csv` and aggregate
+`metrics/anchor_protocol_summary.csv`.  The latter compares the GDC physical
+sparse point cloud after projecting it with the Range-GDC spherical convention;
+it does not imply that either anchor protocol should be changed.
+
 ## Evaluation
 
 The primary area is `common_hidden_valid`: valid GT cells on the 60 non-anchor

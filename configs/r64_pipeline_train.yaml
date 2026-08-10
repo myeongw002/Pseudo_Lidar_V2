@@ -9,6 +9,8 @@ threads: 4
 
 sdn_config: ./src/configs/sdn_kitti_train.config
 sdn_checkpoint: /data/kitti/pseudo_lidar/sdn_kitti_train_set/checkpoint.pth.tar
+# Historical SDN output directory name.  The actual split is trainval.txt;
+# retain this tag to avoid moving or overwriting existing SDN outputs.
 data_tag: paper_random1000_seed2026
 sdn_workers: 4
 bval: 1

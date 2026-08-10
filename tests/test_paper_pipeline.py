@@ -1,178 +1,136 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
-import run_r64_pipeline as pipeline
-from gdc.gdc import anchor_accept_mask, subsample_mask_by_grid
-from range_gdc.evaluate_range_metrics import area_supports, leakage_row
-from range_gdc.range_gdc import _apply_anchor_reject
+from range_gdc.evaluate_range_metrics import leakage_row
+from range_gdc.make_anchor_from_gt_range import process_one
+from range_gdc.range_gdc import RangeROIGDC, _apply_anchor_reject, select_residuals
 from range_gdc.range_projection import range_to_velo
-from range_gdc.range_to_pointcloud import load_centers
-from src.pseudo_lidar.depth_to_range_uniform import (
-    lidar_points_to_spherical_guide_uniform,
-    make_uniform_vertical_grid,
-    projection_metadata,
-)
+from src.pseudo_lidar.depth_to_range_uniform import lidar_points_to_spherical_guide_uniform
+from tools import run_range_gdc_experiment as pipeline
 
 
 class PaperPipelineTests(unittest.TestCase):
-    def test_legacy_method_specific_defaults_are_preserved(self):
-        cfg = pipeline.migrate_config({
-            "gdc": {"disable_subsample": True},
-            "range_gdc": {"anchor_reject": "none"},
-        })
-        self.assertTrue(cfg["original_gdc"]["run_naive"])
-        self.assertFalse(cfg["original_gdc"]["run_optimized"])
-        self.assertNotIn("anchor_reject", cfg["original_gdc"])
-        self.assertEqual(cfg["range_gdc"]["anchor_reject"], "none")
+    def test_canonical_runner_builds_confidence_hard_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            split = root / "split.txt"
+            split.write_text("0\n")
+            cfg = {
+                "output_root": str(root / "output"), "kitti_root": str(root / "kitti"),
+                "split_file": str(split), "data_tag": "unit", "range_anchor": {"selected_rows": [1]},
+                "anchor": {"selected_lines": [1]}, "range_gdc": {"selection_mode": "confidence_hard"},
+            }
+            args = type("Args", (), {"config": str(root / "config.yaml"), "threads": 1, "data_tag": None, "output_root": None,
+                "kitti_root": None, "split_file": None, "sdn_config": None, "sdn_checkpoint": None,
+                "no_distance_eval": True})()
+            with mock.patch.object(pipeline, "load_yaml", return_value=cfg):
+                with mock.patch.object(pipeline, "read_split_ids", return_value=["000000"]):
+                    with mock.patch.object(pipeline, "resolve", side_effect=lambda value: Path(value)):
+                        context = pipeline.build_context(args)
+            context["args"] = args
+            commands = pipeline.build_stages(context)["range_gdc"].commands_fn()[0]
+            self.assertIn("--selection_mode", commands)
+            self.assertEqual(commands[commands.index("--selection_mode") + 1], "confidence_hard")
 
-    def test_shared_sparse_directory_is_both_anchor_source(self):
-        cfg = pipeline.migrate_config({
-            "output_root": "/tmp/paper",
-            "kitti_root": "/tmp/kitti",
-            "split_file": "split/test_1.txt",
-            "sdn_config": "src/configs/sdn_kitti_train.config",
-            "sdn_checkpoint": "/tmp/model.pth",
-            "data_tag": "test",
-            "anchor": {"mode": "shared_pointcloud", "selected_lines": [5, 7, 9, 11]},
-            "original_gdc": {},
-            "range_gdc": {},
-        })
-        paths = pipeline.collect_paths(cfg, ["gdc", "range_gdc"])
-        depth_cmd = pipeline.build_ptc2depthmap_command(
-            paths["anchor_sparse_ptc_path"], paths["anchor_depthmap_path"], paths, 1
+    def test_abs_anchor_rejection_boundary(self):
+        guide = np.array([[10.0, 10.0]], dtype=np.float32)
+        anchor = np.array([[12.0, 11.999]], dtype=np.float32)
+        kept, rejected = _apply_anchor_reject(np.ones_like(guide, dtype=bool), guide, anchor, "abs", 0.4, 2.0)
+        self.assertEqual(kept.tolist(), [[False, True]])
+        self.assertEqual(rejected, 1)
+
+    def test_log_ratio_anchor_rejection_boundary(self):
+        guide = np.array([[10.0, 10.0]], dtype=np.float32)
+        anchor = np.array([[10.0 * np.exp(0.4), 10.0 * np.exp(0.399)]], dtype=np.float32)
+        kept, rejected = _apply_anchor_reject(np.ones_like(guide, dtype=bool), guide, anchor, "log_ratio", 0.4, 2.0)
+        self.assertEqual(kept.tolist(), [[False, True]])
+        self.assertEqual(rejected, 1)
+
+    def test_soft_fusion_uses_method_equation_for_all_valid_direct_proposals(self):
+        final, _, _ = select_residuals(
+            np.array([0.2, -0.2]), np.array([1.0, -1.0]), np.array([0.1, 0.9]),
+            np.array([0.01, 0.01]), selection_mode="soft",
         )
-        range_cmd = pipeline.build_range_projection_command(
-            "ptc-to-range", paths["anchor_sparse_ptc_path"],
-            paths["anchor_range_root_path"], paths, {}, 1
+        self.assertTrue(np.allclose(final, [0.28, -0.92]))
+
+    def test_confidence_hard_selects_graph_direct_and_midpoint_blend(self):
+        final, stats, _ = select_residuals(
+            np.zeros(3), np.array([1.0, -1.0, 2.0]), np.array([0.9, 0.1, 0.5]),
+            np.array([0.01, 0.01, 0.01]), selection_mode="confidence_hard",
         )
-        self.assertIn(str(paths["anchor_sparse_ptc_path"]), depth_cmd)
-        self.assertIn(str(paths["anchor_sparse_ptc_path"]), range_cmd)
+        self.assertTrue(np.allclose(final, [1.0, 0.0, 1.0]))
+        self.assertEqual((stats["selection_direct_count"], stats["selection_graph_count"], stats["selection_blend_count"]), (1, 1, 1))
 
-    def test_mismatched_method_anchor_directory_is_rejected(self):
-        cfg = pipeline.migrate_config({
-            "output_root": "/tmp/paper_mismatch",
-            "kitti_root": "/tmp/kitti",
-            "split_file": "split/test_1.txt",
-            "sdn_config": "src/configs/sdn_kitti_train.config",
-            "sdn_checkpoint": "/tmp/model.pth", "data_tag": "test",
-            "anchor": {"mode": "shared_pointcloud", "selected_lines": [5]},
-            "original_gdc": {"shared_anchor_pointcloud_path": "/tmp/wrong"},
-            "range_gdc": {},
-        })
-        paths = pipeline.collect_paths(cfg, ["gdc", "range_gdc"])
-        with self.assertRaises(ValueError):
-            pipeline.validate_shared_anchor_config(cfg, paths, ["gdc", "range_gdc"])
+    @staticmethod
+    def correction_fixture():
+        guide = np.full((4, 5), 10.0, dtype=np.float32)
+        anchor = np.zeros_like(guide)
+        anchor[1, 2] = 11.0
+        return guide, anchor
 
-    def test_anchor_reject_modes_and_strict_boundaries(self):
-        pred = np.array([[10.0, 10.0, 10.0]], dtype=np.float32)
-        anchor = np.array([[12.0, 11.999, 10.0 * np.exp(0.4)]], dtype=np.float32)
-        candidate = np.ones_like(pred, dtype=bool)
-        self.assertTrue(np.all(anchor_accept_mask(pred, anchor, candidate, "none")))
-        accepted_abs = anchor_accept_mask(pred, anchor, candidate, "abs", 2.0, 0.4)
-        self.assertEqual(accepted_abs.tolist(), [[False, True, False]])
-        accepted_log = anchor_accept_mask(pred, anchor, candidate, "log_ratio", 2.0, 0.4)
-        self.assertFalse(bool(accepted_log[0, 2]))
-        range_kept, rejected = _apply_anchor_reject(
-            candidate, pred, anchor, "abs", 0.4, 2.0
-        )
-        self.assertFalse(bool(range_kept[0, 0]))
-        self.assertEqual(rejected, 2)
+    def test_graph_only_does_not_construct_direct_branch(self):
+        guide, anchor = self.correction_fixture()
+        with mock.patch("range_gdc.range_gdc.build_direct_residual_transfer", side_effect=AssertionError):
+            _, _, stats, debug = RangeROIGDC(guide, anchor, ablation_mode="graph_only", return_stats=True, return_debug=True)
+        self.assertEqual(stats["selection_direct_count"], 0)
+        self.assertTrue(np.all(debug["selection_graph_mask"]))
 
-    def _roundtrip_projection(self, mode, amin=None, amax=None):
+    def test_direct_only_does_not_construct_graph_branch_or_fallback(self):
+        guide, anchor = self.correction_fixture()
+        with mock.patch("range_gdc.range_gdc.build_spherical_graph_laplacian", side_effect=AssertionError):
+            _, _, stats, debug = RangeROIGDC(guide, anchor, ablation_mode="direct_only", return_stats=True, return_debug=True)
+        self.assertEqual(stats["selection_graph_count"], 0)
+        self.assertTrue(np.allclose(debug["delta_final"], debug["delta_direct"]))
+
+    def test_accepted_anchor_force_is_identical_across_variants(self):
+        guide, anchor = self.correction_fixture()
+        for mode in ("full", "graph_only", "direct_only"):
+            corrected, _, stats = RangeROIGDC(guide, anchor, ablation_mode=mode, return_stats=True)
+            self.assertEqual(stats["anchor_forced_count"], 1)
+            self.assertEqual(corrected[1, 2], anchor[1, 2])
+
+    def test_spherical_projection_round_trip(self):
         points = np.array([[10.0, 0.0, 0.0], [8.0, 2.0, -1.0]], dtype=np.float32)
-        image, mask = lidar_points_to_spherical_guide_uniform(
-            points, range_h=16, range_w=64, vmin_deg=-25, vmax_deg=5,
-            azimuth_mode=mode, azimuth_min_deg=amin, azimuth_max_deg=amax,
-            range_min=0.1, range_max=80.0,
-        )
-        args = SimpleNamespace(
-            range_h=16, range_w=64, vmin_deg=-25, vmax_deg=5,
-            azimuth_mode=mode, azimuth_min_deg=amin, azimuth_max_deg=amax,
-            meta_path=None,
-        )
+        image, mask = lidar_points_to_spherical_guide_uniform(points, range_h=16, range_w=64, vmin_deg=-25, vmax_deg=5)
+        args = type("Args", (), {"range_h": 16, "range_w": 64, "vmin_deg": -25, "vmax_deg": 5,
+            "azimuth_mode": "full_360_front_centered", "azimuth_min_deg": None,
+            "azimuth_max_deg": None, "meta_path": None})()
         reconstructed = range_to_velo(image, args)
-        image2, mask2 = lidar_points_to_spherical_guide_uniform(
-            reconstructed, range_h=16, range_w=64, vmin_deg=-25, vmax_deg=5,
-            azimuth_mode=mode, azimuth_min_deg=amin, azimuth_max_deg=amax,
-            range_min=0.1, range_max=80.0,
-        )
+        image2, mask2 = lidar_points_to_spherical_guide_uniform(reconstructed, range_h=16, range_w=64, vmin_deg=-25, vmax_deg=5)
         self.assertTrue(np.array_equal(mask, mask2))
         self.assertTrue(np.allclose(image[mask], image2[mask2], atol=1e-5))
 
-    def test_full_360_projection_inverse(self):
-        self._roundtrip_projection("full_360_front_centered")
+    def test_fixed_row_anchor_has_no_values_outside_selected_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gt_dir, out_dir, mask_dir, meta_dir = (root / name for name in ("gt", "anchor", "mask", "meta"))
+            gt_dir.mkdir()
+            gt = np.full((4, 5), 10.0, dtype=np.float32)
+            np.save(gt_dir / "000000.npy", gt)
+            args = type("Args", (), {"gt_range_path": str(gt_dir), "output_range_path": str(out_dir),
+                "output_mask_path": str(mask_dir), "meta_dir": str(meta_dir), "expected_height": 4,
+                "expected_width": 5, "selected_rows": [1, 3], "invalid_value": 0.0})()
+            process_one(0, args)
+            anchor = np.load(out_dir / "000000.npy")
+            self.assertFalse(np.any(anchor[[0, 2]]))
+            self.assertTrue(np.all(anchor[[1, 3]] == gt[[1, 3]]))
 
-    def test_bounded_projection_inverse(self):
-        self._roundtrip_projection("bounded", -45.0, 45.0)
-
-    def test_metadata_free_vertical_fallback_uses_highest_row_zero(self):
-        vertical, _ = load_centers(None, 8, 16, -24.9, 2.0,
-                                   "full_360_front_centered", None, None)
-        expected = make_uniform_vertical_grid(8, -24.9, 2.0)[1]
-        self.assertTrue(np.array_equal(vertical, expected))
-        self.assertGreater(vertical[0], vertical[-1])
-
-    def test_deterministic_subsampling(self):
-        rng = np.random.default_rng(4)
-        points = np.column_stack((
-            rng.uniform(-20, 20, 500), rng.uniform(-0.9, 2.4, 500),
-            rng.uniform(1.1, 70, 500),
-        ))
-        a = subsample_mask_by_grid(points, "deterministic", 0)
-        b = subsample_mask_by_grid(points, "deterministic", 999)
-        self.assertTrue(np.array_equal(a, b))
-
-    def test_common_hidden_valid_and_coverage_support(self):
+    def test_hidden_row_leakage_is_detected(self):
         gt = np.ones((4, 5), dtype=np.float32) * 10
-        guide = gt.copy()
-        guide[1, :] = 0
-        args = SimpleNamespace(
-            range_min=0.1, range_max=80.0, source_rows=2, row_offset=None,
-            row_stride=None, source_row_indices=[0], selected_rows_dir=None,
-            projection_selected_rows=None,
-        )
-        supports, _, _, gt_valid = area_supports(0, gt, guide, guide, args)
-        pred_a = gt > 0
-        pred_b = gt > 0
-        pred_b[2, 0] = False
-        common_hidden = supports["hidden_rows_valid"] & gt_valid & pred_a & pred_b
-        self.assertFalse(common_hidden[0].any())
-        self.assertFalse(common_hidden[2, 0])
-        denominator = int((gt_valid & supports["hidden_rows_valid"]).sum())
-        self.assertEqual(int(common_hidden.sum()), denominator - 1)
-
-    def test_hidden_row_anchor_leakage_is_detected(self):
-        gt = np.ones((4, 5), dtype=np.float32) * 10
-        pred = gt.copy()
         anchor = np.zeros_like(gt)
         anchor[1, 2] = 10
-        args = SimpleNamespace(
-            enable_leakage_check=True, leakage_method="range_gdc",
-            range_min=0.1, range_max=80.0, source_rows=1,
-            row_offset=None, row_stride=None, source_row_indices=[0],
-            selected_rows_dir=None, projection_selected_rows=None,
-            expected_height=4, expected_width=5,
-            leakage_anchor_row_tolerance=0, leakage_zero_eps=1e-6,
-            leakage_warn_err_zero_ratio=0.01,
-            leakage_warn_err_5cm_ratio=0.8,
-        )
+        args = type("Args", (), {"enable_leakage_check": True, "leakage_method": "range_gdc",
+            "range_min": 0.1, "range_max": 80.0, "source_rows": 1, "row_offset": None,
+            "row_stride": None, "source_row_indices": [0], "selected_rows_dir": None,
+            "projection_selected_rows": None, "expected_height": 4, "expected_width": 5,
+            "leakage_anchor_row_tolerance": 0, "leakage_zero_eps": 1e-6,
+            "leakage_warn_err_zero_ratio": 0.01, "leakage_warn_err_5cm_ratio": 0.8})()
         with self.assertRaises(ValueError):
-            leakage_row(0, {"range_gdc": pred}, gt, anchor, args)
-
-    def test_projection_metadata_fields(self):
-        meta = projection_metadata(64, 1024, -24.9, 2.0,
-                                   "full_360_front_centered")
-        for key in (
-            "azimuth_min_deg", "azimuth_max_deg", "azimuth_span_deg",
-            "horizontal_resolution_deg", "vertical_resolution_deg",
-            "row0_elevation_direction", "camera_fov_only",
-            "valid_column_count", "valid_azimuth_span_deg",
-        ):
-            self.assertIn(key, meta)
+            leakage_row(0, {"range_gdc": gt.copy()}, gt, anchor, args)
 
 
 if __name__ == "__main__":

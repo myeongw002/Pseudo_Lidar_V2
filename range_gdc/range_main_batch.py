@@ -372,11 +372,12 @@ def parse_args():
     parser.add_argument("--method", choices=["cg", "spsolve"], default="cg")
     parser.add_argument("--range_min", type=float, default=0.1)
     parser.add_argument("--range_max", type=float, default=80.0)
-    parser.add_argument("--anchor_reject", choices=["log_ratio", "abs", "none"], default="log_ratio")
+    # Keep standalone execution aligned with the checked-in paper configs.
+    parser.add_argument("--anchor_reject", choices=["log_ratio", "abs", "none"], default="abs")
     parser.add_argument("--log_ratio_thr", type=float, default=0.4)
     parser.add_argument("--abs_error_thr", type=float, default=2.0)
     parser.add_argument("--lambda_anchor", type=float, default=300.0)
-    parser.add_argument("--lambda_prior", type=float, default=0.05)
+    parser.add_argument("--lambda_prior", type=float, default=0.1)
     parser.add_argument("--lambda_smooth", type=float, default=1.0)
     parser.add_argument("--neighbor", choices=["angular_grid4", "angular_grid8"], default="angular_grid8")
     parser.add_argument("--edge_spatial_mode", choices=["angular", "tangent"], default="angular")
@@ -404,7 +405,7 @@ def parse_args():
     parser.add_argument("--confidence_low_thr", type=float, default=0.2)
     parser.add_argument("--direct_log_range_thr", type=float, default=0.05)
     parser.add_argument("--graph_log_range_thr", type=float, default=0.2)
-    parser.add_argument("--delta_clip", type=float, default=0.5)
+    parser.add_argument("--delta_clip", type=float, default=0.3)
     parser.add_argument(
         "--anchor_force_policy",
         choices=["accepted_only", "all_valid", "none"],

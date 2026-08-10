@@ -695,11 +695,11 @@ def RangeROIGDC(
     method="cg",
     range_min=0.1,
     range_max=80.0,
-    anchor_reject="log_ratio",
+    anchor_reject="abs",
     log_ratio_thr=0.4,
     abs_error_thr=2.0,
     lambda_anchor=300.0,
-    lambda_prior=0.05,
+    lambda_prior=0.1,
     lambda_smooth=1.0,
     neighbor="angular_grid8",
     edge_spatial_mode="angular",
@@ -723,7 +723,7 @@ def RangeROIGDC(
     confidence_low_thr=0.2,
     direct_log_range_thr=0.05,
     graph_log_range_thr=0.2,
-    delta_clip=0.5,
+    delta_clip=0.3,
     force_anchor_value=None,
     anchor_force_policy="accepted_only",
     return_debug=False,
@@ -941,82 +941,71 @@ def RangeROIGDC(
     before_err = guide_range[target_mask] - anchor_range[target_mask]
     stats["anchor_abs_error_before"], stats["anchor_rmse_before"] = _mean_abs_and_rmse(before_err)
 
-    t_graph0 = time.perf_counter()
-    L, graph_stats, graph_debug = build_spherical_graph_laplacian(
-        guide_range,
-        guide_valid,
-        node_id,
-        node_rows,
-        node_cols,
-        vertical_centers_deg=vertical_centers_deg,
-        azimuth_centers_deg=azimuth_centers_deg,
-        azimuth_mode=azimuth_mode,
-        neighbor=neighbor,
-        edge_spatial_mode=edge_spatial_mode,
-        sigma_angular=sigma_angular,
-        sigma_tangent=sigma_tangent,
-        sigma_log_range=sigma_log_range,
-        max_log_range_diff=max_log_range_diff,
-    )
-    stats["t_build_graph"] = time.perf_counter() - t_graph0
-    stats.update(graph_stats)
+    # Ablations do not construct the branch they are intended to remove.  This
+    # keeps their computation and their final residual semantics unambiguous.
+    L = A = b = None
+    graph_debug = {}
+    if ablation_mode == "direct_only":
+        delta_graph = np.full((N,), np.nan, dtype=np.float64)
+    else:
+        t_graph0 = time.perf_counter()
+        L, graph_stats, graph_debug = build_spherical_graph_laplacian(
+            guide_range, guide_valid, node_id, node_rows, node_cols,
+            vertical_centers_deg=vertical_centers_deg,
+            azimuth_centers_deg=azimuth_centers_deg, azimuth_mode=azimuth_mode,
+            neighbor=neighbor, edge_spatial_mode=edge_spatial_mode,
+            sigma_angular=sigma_angular, sigma_tangent=sigma_tangent,
+            sigma_log_range=sigma_log_range, max_log_range_diff=max_log_range_diff,
+        )
+        stats["t_build_graph"] = time.perf_counter() - t_graph0
+        stats.update(graph_stats)
+        t_solve0 = time.perf_counter()
+        delta_graph, info, solve_residual, A, b = _solve_graph_delta(
+            L, target_node_indices, target_delta, method=method,
+            lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
+            lambda_smooth=lambda_smooth,
+        )
+        if delta_clip is not None:
+            delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
+        stats["t_graph_solve"] = time.perf_counter() - t_solve0
+        stats["solver_info"] = str(info)
+        stats["solve_residual"] = solve_residual
+        if info != 0:
+            stats["status"] = f"solver_info_{info}"
+        stats.update(_vector_stats(delta_graph, "delta_graph"))
+        stats["propagation_ratio_graph"] = float(
+            stats["delta_graph_abs_mean"] / max(stats["residual_target_abs_mean"], 1e-12)
+        ) if np.isfinite(stats["delta_graph_abs_mean"]) and np.isfinite(stats["residual_target_abs_mean"]) else np.nan
+        graph_node_values = np.exp(raw_log_nodes + delta_graph).astype(np.float32)
+        corrected_graph = guide_range.copy()
+        corrected_graph[guide_valid] = np.clip(graph_node_values, range_min, range_max)
+        graph_err = corrected_graph[target_mask] - anchor_range[target_mask]
+        stats["anchor_abs_error_after_graph_solve"], stats["anchor_rmse_after_graph_solve"] = _mean_abs_and_rmse(graph_err)
 
-    t_solve0 = time.perf_counter()
-    delta_graph, info, solve_residual, A, b = _solve_graph_delta(
-        L,
-        target_node_indices,
-        target_delta,
-        method=method,
-        lambda_anchor=lambda_anchor,
-        lambda_prior=lambda_prior,
-        lambda_smooth=lambda_smooth,
-    )
-    if delta_clip is not None:
-        delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
-    stats["t_graph_solve"] = time.perf_counter() - t_solve0
-    stats["solver_info"] = str(info)
-    stats["solve_residual"] = solve_residual
-    if info != 0:
-        stats["status"] = f"solver_info_{info}"
-    stats.update(_vector_stats(delta_graph, "delta_graph"))
-    stats["propagation_ratio_graph"] = float(
-        stats["delta_graph_abs_mean"] / max(stats["residual_target_abs_mean"], 1e-12)
-    ) if np.isfinite(stats["delta_graph_abs_mean"]) and np.isfinite(stats["residual_target_abs_mean"]) else np.nan
-
-    graph_node_values = np.exp(raw_log_nodes + delta_graph).astype(np.float32)
-    graph_node_values = np.clip(graph_node_values, range_min, range_max)
-    corrected_graph = guide_range.copy()
-    corrected_graph[guide_valid] = graph_node_values
-    graph_err = corrected_graph[target_mask] - anchor_range[target_mask]
-    stats["anchor_abs_error_after_graph_solve"], stats["anchor_rmse_after_graph_solve"] = _mean_abs_and_rmse(graph_err)
-
-    delta_direct, confidence, nearest_dist, nearest_log_diff, direct_stats, transfer_debug = build_direct_residual_transfer(
-        raw_log_nodes,
-        node_rows,
-        node_cols,
-        target_node_indices,
-        target_delta,
-        shape=guide_range.shape,
-        transfer_k=transfer_k,
-        transfer_neighbor_mode=transfer_neighbor_mode,
-        direct_weight_mode=direct_weight_mode,
-        confidence_mode=confidence_mode,
-        sigma_conf_pixel=sigma_conf_pixel,
-        sigma_conf_angular=sigma_conf_angular,
-        sigma_conf_log_range=sigma_conf_log_range,
-        confidence_power=confidence_power,
-        confidence_min=confidence_min,
-        confidence_max=confidence_max,
-        vertical_centers_deg=vertical_centers_deg,
-        azimuth_centers_deg=azimuth_centers_deg,
-        azimuth_mode=azimuth_mode,
-    )
-    if delta_clip is not None:
-        delta_direct = np.clip(delta_direct, -float(delta_clip), float(delta_clip))
-    stats["t_find_nearest_anchor"] = direct_stats.pop("t_find_nearest_anchor", 0.0)
-    stats["t_build_direct_transfer"] = direct_stats.pop("t_build_direct_transfer", 0.0)
-    stats.update(_vector_stats(delta_direct, "delta_direct"))
-    stats.update(direct_stats)
+    transfer_debug = {}
+    if ablation_mode == "graph_only":
+        delta_direct = np.full((N,), np.nan, dtype=np.float64)
+        confidence = np.full((N,), np.nan, dtype=np.float64)
+        nearest_dist = np.full((N,), np.nan, dtype=np.float64)
+        nearest_log_diff = np.full((N,), np.nan, dtype=np.float64)
+    else:
+        delta_direct, confidence, nearest_dist, nearest_log_diff, direct_stats, transfer_debug = build_direct_residual_transfer(
+            raw_log_nodes, node_rows, node_cols, target_node_indices, target_delta,
+            shape=guide_range.shape, transfer_k=transfer_k,
+            transfer_neighbor_mode=transfer_neighbor_mode,
+            direct_weight_mode=direct_weight_mode, confidence_mode=confidence_mode,
+            sigma_conf_pixel=sigma_conf_pixel, sigma_conf_angular=sigma_conf_angular,
+            sigma_conf_log_range=sigma_conf_log_range, confidence_power=confidence_power,
+            confidence_min=confidence_min, confidence_max=confidence_max,
+            vertical_centers_deg=vertical_centers_deg,
+            azimuth_centers_deg=azimuth_centers_deg, azimuth_mode=azimuth_mode,
+        )
+        if delta_clip is not None:
+            delta_direct = np.clip(delta_direct, -float(delta_clip), float(delta_clip))
+        stats["t_find_nearest_anchor"] = direct_stats.pop("t_find_nearest_anchor", 0.0)
+        stats["t_build_direct_transfer"] = direct_stats.pop("t_build_direct_transfer", 0.0)
+        stats.update(_vector_stats(delta_direct, "delta_direct"))
+        stats.update(direct_stats)
     conf_finite = confidence[np.isfinite(confidence)]
     if conf_finite.size:
         stats["confidence_mean"] = float(np.mean(conf_finite))
