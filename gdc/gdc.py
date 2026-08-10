@@ -118,6 +118,34 @@ def depth2ptc(depth, calib):
     return calib.project_image_to_rect(points)
 
 
+def image_anchor_candidate_masks(
+    pred_depth, anchor_depth, calib, consider_range=(-0.1, 3.0),
+    subsample=False, subsample_strategy="legacy_random", subsample_seed=None,
+):
+    """Return production GDC anchor candidate, prediction, and overlap masks."""
+    ptc_pred = depth2ptc(pred_depth, calib)
+    consider_pl = (
+        filter_mask(ptc_pred)
+        * filter_theta_mask(
+            ptc_pred,
+            low=np.radians(consider_range[0]),
+            high=np.radians(consider_range[1]),
+        )
+    ).reshape(pred_depth.shape)
+    subsample_mask = None
+    if subsample:
+        subsample_mask = subsample_mask_by_grid(
+            ptc_pred, strategy=subsample_strategy, seed=subsample_seed
+        ).reshape(pred_depth.shape)
+        consider_pl &= subsample_mask
+    anchor_candidate = (
+        (anchor_depth > 0)
+        & filter_mask(depth2ptc(anchor_depth, calib)).reshape(anchor_depth.shape)
+    )
+    anchor_overlap = anchor_candidate & consider_pl
+    return anchor_candidate, consider_pl, anchor_overlap, subsample_mask
+
+
 def GDC(pred_depth, gt_depth, calib,
         k=10,
         W_tol=1e-5,
@@ -171,20 +199,15 @@ def GDC(pred_depth, gt_depth, calib,
         print("warpping up depth infos...")
 
     ptc = depth2ptc(pred_depth, calib)
-    consider_PL = (filter_mask(ptc) * filter_theta_mask(
-        ptc, low=np.radians(consider_range[0]),
-        high=np.radians(consider_range[1]))).reshape(pred_depth.shape)
-    if subsample:
-        subsample_mask = subsample_mask_by_grid(
-            ptc, strategy=subsample_strategy, seed=subsample_seed
-        ).reshape(pred_depth.shape)
-        consider_PL = consider_PL * subsample_mask
-
-
-    consider_L = filter_mask(depth2ptc(gt_depth, calib)
-                             ).reshape(gt_depth.shape)
-    anchor_candidate = (gt_depth > 0) & consider_L
-    anchor_overlap = anchor_candidate & consider_PL
+    anchor_candidate, consider_PL, anchor_overlap, subsample_mask = image_anchor_candidate_masks(
+        pred_depth,
+        gt_depth,
+        calib,
+        consider_range=consider_range,
+        subsample=subsample,
+        subsample_strategy=subsample_strategy,
+        subsample_seed=subsample_seed,
+    )
     gt_mask = anchor_accept_mask(
         pred_depth,
         gt_depth,

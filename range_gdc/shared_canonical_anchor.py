@@ -99,13 +99,24 @@ def extract_shared_points(original_points, source_index, selected_rows):
     return original_points[indices].copy(), indices.astype(np.int32)
 
 
-def shared_points_to_camera_depth(points, calib, image_shape, invalid_value=-1.0):
-    """Project shared points with nearest-positive camera-z pixel collisions."""
+def shared_points_to_camera_depth(
+    points, calib, image_shape, invalid_value=-1.0, source_indices=None,
+    return_source_index=False,
+):
+    """Project points with coupled nearest-positive depth/source winners."""
     height, width = image_shape[:2]
     depth = np.full((height, width), float(invalid_value), dtype=np.float32)
+    source_map = np.full((height, width), INVALID_SOURCE_INDEX, dtype=np.int32)
     points = np.asarray(points, dtype=np.float32)
+    if source_indices is None:
+        source_indices = np.arange(points.shape[0] if points.ndim else 0, dtype=np.int32)
+    source_indices = np.asarray(source_indices, dtype=np.int32)
     if points.size == 0:
-        return depth
+        return (depth, source_map) if return_source_index else depth
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError("points must have shape (N, >=3)")
+    if source_indices.shape != (points.shape[0],):
+        raise ValueError("source_indices must have one entry per point")
     image = calib.project_velo_to_image(points[:, :3])
     rect = calib.project_velo_to_rect(points[:, :3])
     cols = np.round(image[:, 0]).astype(np.int64)
@@ -114,14 +125,20 @@ def shared_points_to_camera_depth(points, calib, image_shape, invalid_value=-1.0
     valid = (np.isfinite(z) & (z > 0) & (cols >= 0) & (cols < width)
              & (rows >= 0) & (rows < height))
     if np.any(valid):
-        nearest = np.full((height, width), np.inf, dtype=np.float32)
-        np.minimum.at(nearest, (rows[valid], cols[valid]), z[valid])
-        depth[np.isfinite(nearest)] = nearest[np.isfinite(nearest)]
-    return depth
+        valid_rows, valid_cols, valid_z = rows[valid], cols[valid], z[valid]
+        valid_source = source_indices[valid]
+        flat = valid_rows * width + valid_cols
+        order = np.lexsort((valid_source, valid_z, flat))
+        ordered_flat = flat[order]
+        winners = order[np.r_[True, ordered_flat[1:] != ordered_flat[:-1]]]
+        depth[valid_rows[winners], valid_cols[winners]] = valid_z[winners]
+        source_map[valid_rows[winners], valid_cols[winners]] = valid_source[winners]
+    return (depth, source_map) if return_source_index else depth
 
 
 def shared_points_to_gdc_depth(
     points, calib, image_shape, clip_distance=2.0, invalid_value=-1.0,
+    source_indices=None, return_source_index=False,
 ):
     """Apply canonical GDC FOV filtering and nearest-positive camera-z projection.
 
@@ -132,12 +149,18 @@ def shared_points_to_gdc_depth(
     the nearest positive rect-camera z for collisions.
     """
     points = np.asarray(points, dtype=np.float32)
+    if source_indices is None:
+        source_indices = np.arange(points.shape[0] if points.ndim else 0, dtype=np.int32)
+    source_indices = np.asarray(source_indices, dtype=np.int32)
     if points.size == 0:
         return shared_points_to_camera_depth(
-            points, calib, image_shape, invalid_value=invalid_value
+            points, calib, image_shape, invalid_value=invalid_value,
+            source_indices=source_indices, return_source_index=return_source_index,
         )
     if points.ndim != 2 or points.shape[1] < 3:
         raise ValueError("points must have shape (N, >=3)")
+    if source_indices.shape != (points.shape[0],):
+        raise ValueError("source_indices must have one entry per point")
     height, width = image_shape[:2]
     projected = calib.project_velo_to_image(points[:, :3])
     fov = (
@@ -148,7 +171,8 @@ def shared_points_to_gdc_depth(
         & (points[:, 0] > float(clip_distance))
     )
     return shared_points_to_camera_depth(
-        points[fov], calib, image_shape, invalid_value=invalid_value
+        points[fov], calib, image_shape, invalid_value=invalid_value,
+        source_indices=source_indices[fov], return_source_index=return_source_index,
     )
 
 

@@ -224,6 +224,16 @@ def validate_depth_dir(depth_dir, ids):
             raise ValueError(f"{depth_dir}/{scene_id}: valid depth count is zero")
 
 
+def validate_image_source_index_dir(source_dir, ids):
+    validate_file_count(source_dir, ids)
+    for scene_id in ids[: min(5, len(ids))]:
+        source = load_frame_npy(source_dir, scene_id)
+        if source.ndim != 2 or not np.issubdtype(source.dtype, np.integer):
+            raise ValueError(f"{source_dir}/{scene_id}: expected 2D integer source-index map")
+        if not np.any(source >= 0):
+            raise ValueError(f"{source_dir}/{scene_id}: no valid GDC source winners")
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as f:
@@ -553,6 +563,7 @@ def build_context(args):
         "anchor_source_index": output_root / "anchor" / "shared_canonical_source_index",
         "anchor_provenance": output_root / "anchor" / "shared_canonical_pointcloud_provenance.json",
         "anchor_image_depth": output_root / "anchor" / "shared_canonical_image_depth",
+        "anchor_image_source_index": output_root / "anchor" / "shared_canonical_image_source_index",
         "anchor_range_root": output_root / "anchor" / "range_shared_canonical",
         "anchor_range": output_root / "anchor" / "range_shared_canonical" / "G64_range",
         "anchor_mask": output_root / "anchor" / "range_shared_canonical" / "G64_mask",
@@ -779,6 +790,9 @@ def build_stages(ctx):
             "--threads", str(anchor.get("threads", ctx["threads"])),
             "--collision-policy", "nearest_positive",
             "--provenance-json", str(p["anchor_provenance"]),
+            "--source-index-input-path", str(p["anchor_source_index"]),
+            "--source-index-output-path", str(p["anchor_image_source_index"]),
+            "--selected-rows", *[str(row) for row in ctx["selected_rows"]],
         ]]
 
 
@@ -940,7 +954,17 @@ def build_stages(ctx):
             shared_anchor_pointcloud_commands,
             lambda ids: validate_shared_anchor_provenance(p["anchor_provenance"], p["anchor_sparse_pc"], p["anchor_source_index"], ids, projection, ctx["selected_rows"]),
         ),
-        Stage("canonical_shared_anchor_image_depth", [p["anchor_sparse_pc"], p["anchor_provenance"]], [p["anchor_image_depth"]], [p["anchor_image_depth"]], shared_anchor_image_depth_commands, lambda ids: validate_depth_dir(p["anchor_image_depth"], ids)),
+        Stage(
+            "canonical_shared_anchor_image_depth",
+            [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"]],
+            [p["anchor_image_depth"], p["anchor_image_source_index"]],
+            [p["anchor_image_depth"], p["anchor_image_source_index"]],
+            shared_anchor_image_depth_commands,
+            lambda ids: (
+                validate_depth_dir(p["anchor_image_depth"], ids),
+                validate_image_source_index_dir(p["anchor_image_source_index"], ids),
+            ),
+        ),
         Stage("gt_range", [p["velodyne"]], [p["gt_range"], p["gt_mask"], p["gt_meta"]], [p["gt_range_root"]], lambda: [range_projection_cmd("ptc-to-range", p["velodyne"], p["gt_range_root"], ctx, image_fov_only=not ctx["args"].full_lidar_gt)], lambda ids: validate_range_dir(p["gt_range"], ids, expected_shape)),
         Stage(
             "range_anchor_from_shared_anchor",

@@ -16,8 +16,13 @@ from range_gdc.shared_canonical_anchor import (
     shared_points_to_gdc_depth,
 )
 from ptc2depthmap import get_depth_map
+from gdc import anchor_accept_mask
 from tools import run_range_gdc_experiment as pipeline
 from tools.audit_shared_anchor_protocol import audit_frame, aggregate_audit
+from tools.audit_anchor_rejection_consistency import (
+    common_source_locations, frame_point_rows, rejection_category, source_locations,
+    summarize_point_rows,
+)
 from tools.run_fusion_comparison import aggregate_common_hidden_metrics
 
 
@@ -30,6 +35,10 @@ class PaperPipelineTests(unittest.TestCase):
         def project_velo_to_rect(self, points):
             points = np.asarray(points, dtype=np.float32)
             return np.column_stack((points[:, 1], points[:, 2], points[:, 0]))
+
+        def project_image_to_rect(self, points):
+            points = np.asarray(points, dtype=np.float32)
+            return np.column_stack((np.zeros(len(points)), np.zeros(len(points)), points[:, 2]))
 
     def test_canonical_gdc_filters_velodyne_x_at_clip_distance(self):
         depth = shared_points_to_gdc_depth(
@@ -77,6 +86,109 @@ class PaperPipelineTests(unittest.TestCase):
         image = np.zeros((10, 10, 3), dtype=np.uint8)
         depth = get_depth_map(points, self.FakeGDCCalibration(), image, "legacy_last")
         self.assertEqual(depth[1, 1], 5.0)
+
+    def test_gdc_depth_source_map_tracks_nearest_collision_winner(self):
+        points = np.array([
+            [5.0, 1.0, 1.0, 0.1], [3.0, 1.0, 1.0, 0.2],
+        ], dtype=np.float32)
+        depth, source = shared_points_to_gdc_depth(
+            points, self.FakeGDCCalibration(), (10, 10, 3),
+            source_indices=np.array([10, 20], dtype=np.int32),
+            return_source_index=True,
+        )
+        self.assertEqual(depth[1, 1], 3.0)
+        self.assertEqual(source[1, 1], 20)
+
+    def test_rejection_common_candidates_exclude_camera_fov_outside_source(self):
+        points = np.array([
+            [3.0, 1.0, 1.0, 0.1], [4.0, 20.0, 1.0, 0.2],
+        ], dtype=np.float32)
+        _, gdc_source = shared_points_to_gdc_depth(
+            points, self.FakeGDCCalibration(), (10, 10, 3),
+            source_indices=np.array([10, 20], dtype=np.int32),
+            return_source_index=True,
+        )
+        rgc_source = np.array([[10, 20]], dtype=np.int32)
+        common = common_source_locations(
+            gdc_source, gdc_source >= 0, rgc_source, rgc_source >= 0
+        )
+        self.assertEqual([row[0] for row in common], [10])
+
+    def test_rejection_common_candidates_exclude_gdc_pixel_collision_loser(self):
+        points = np.array([
+            [5.0, 1.0, 1.0, 0.1], [3.0, 1.0, 1.0, 0.2],
+        ], dtype=np.float32)
+        _, gdc_source = shared_points_to_gdc_depth(
+            points, self.FakeGDCCalibration(), (10, 10, 3),
+            source_indices=np.array([10, 20], dtype=np.int32),
+            return_source_index=True,
+        )
+        rgc_source = np.array([[10, 20]], dtype=np.int32)
+        common = common_source_locations(
+            gdc_source, gdc_source >= 0, rgc_source, rgc_source >= 0
+        )
+        self.assertEqual([row[0] for row in common], [20])
+
+    def test_source_location_mapping_preserves_original_source_identity(self):
+        source = np.array([[-1, 12], [7, -1]], dtype=np.int32)
+        locations = source_locations(source, source >= 0)
+        self.assertEqual(locations, {7: (1, 0), 12: (0, 1)})
+
+    def test_all_rejection_categories_and_count_identity(self):
+        combinations = [
+            (True, True, "both_accepted"),
+            (True, False, "gdc_only_accepted"),
+            (False, True, "rgc_only_accepted"),
+            (False, False, "both_rejected"),
+        ]
+        rows = []
+        for gdc_accept, rgc_accept, expected in combinations:
+            category = rejection_category(gdc_accept, rgc_accept)
+            self.assertEqual(category, expected)
+            rows.append({"category": category, "gdc_abs_error": 1.0, "rgc_abs_error": 1.0})
+        summary = summarize_point_rows(rows)
+        self.assertEqual(summary["total_common_candidates"], 4)
+        self.assertEqual(sum(summary[name] for name in (
+            "both_accepted", "gdc_only_accepted", "rgc_only_accepted", "both_rejected"
+        )), 4)
+
+    def test_rejection_threshold_boundary_matches_both_production_helpers(self):
+        pred = np.array([[10.0, 10.0]], dtype=np.float32)
+        anchor = np.array([[12.0, 11.999]], dtype=np.float32)
+        candidate = np.ones_like(pred, dtype=bool)
+        gdc = anchor_accept_mask(pred, anchor, candidate, "abs", 2.0, 0.4)
+        rgc, _ = _apply_anchor_reject(candidate, pred, anchor, "abs", 0.4, 2.0)
+        self.assertEqual(gdc.tolist(), [[False, True]])
+        self.assertEqual(rgc.tolist(), [[False, True]])
+
+    def test_rejection_mismatch_ratio_uses_common_candidate_denominator(self):
+        rows = [
+            {"category": category, "gdc_abs_error": 1.0, "rgc_abs_error": 1.0}
+            for category in ("both_accepted", "gdc_only_accepted", "rgc_only_accepted", "both_rejected")
+        ]
+        summary = summarize_point_rows(rows)
+        self.assertEqual(summary["rejection_mismatch_count"], 2)
+        self.assertEqual(summary["rejection_mismatch_ratio"], 0.5)
+
+    def test_rejection_audit_frame_classifies_all_categories_by_source_id(self):
+        points = np.array([
+            [10.0, 0.0, 0.0, 0.1], [12.0, 0.0, 0.0, 0.2],
+            [14.0, 0.0, 0.0, 0.3], [16.0, 0.0, 0.0, 0.4],
+        ], dtype=np.float32)
+        source = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        gdc_anchor = np.array([[10.0, 12.0, 14.0, 16.0]], dtype=np.float32)
+        gdc_pred = np.array([[11.0, 13.0, 17.0, 19.0]], dtype=np.float32)
+        rgc_anchor = gdc_anchor.copy()
+        rgc_pred = np.array([[11.0, 15.0, 15.0, 19.0]], dtype=np.float32)
+        rows = frame_point_rows(
+            "000000", points, source, source, gdc_anchor, gdc_pred,
+            rgc_anchor, rgc_pred, self.FakeGDCCalibration(), [0],
+            "abs", 2.0, 0.4, [-0.1, 3.0], 0.1, 80.0,
+        )
+        self.assertEqual([row["source_index"] for row in rows], [0, 1, 2, 3])
+        self.assertEqual([row["category"] for row in rows], [
+            "both_accepted", "gdc_only_accepted", "rgc_only_accepted", "both_rejected"
+        ])
 
     @staticmethod
     def shared_audit_fixture():

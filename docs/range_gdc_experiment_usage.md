@@ -98,6 +98,7 @@ anchor/shared_canonical_pointcloud/
 anchor/shared_canonical_source_index/
 anchor/shared_canonical_pointcloud_provenance.json
 anchor/shared_canonical_image_depth/
+anchor/shared_canonical_image_source_index/
 anchor/range_shared_canonical/G64_range/
 anchor/range_shared_canonical/G64_mask/
 anchor/range_shared_canonical/meta/anchor_definition.json
@@ -145,6 +146,25 @@ python3 -B tools/run_range_gdc_experiment.py \
 
 `gt_range` is included because the current RGC-anchor stage copies the canonical
 projection metadata from that stage; the audit itself does not consume GT values.
+
+## Anchor-rejection consistency audit
+
+After canonical image source-index maps exist, compare native GDC camera-z and
+RGC spherical-range rejection on common original LiDAR source IDs only:
+
+```bash
+python3 -B tools/audit_anchor_rejection_consistency.py \
+  --output-root /data/kitti/pseudo_lidar_shared_canonical_100 \
+  --split-file split/test_100.txt \
+  --kitti-root /data/kitti/kitti_object/testing \
+  --config configs/r64_pipeline_canonical.yaml
+```
+
+This writes per-point, per-frame, global-summary, and distance-bin CSV files
+under `<output_root>/metrics/`. It measures native-rule disagreement and does
+not modify either rejection rule. The default `--gdc-variant naive` uses the
+non-subsampled production candidate mask; pass `--gdc-variant optimized` to
+include the configured optimized-GDC subsampling mask.
 
 ## Distance-bin evaluation
 
