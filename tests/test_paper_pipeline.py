@@ -13,7 +13,6 @@ from range_gdc.range_gdc import (
     RangeROIGDC,
     _apply_anchor_reject,
     build_graph_residual_system,
-    compute_anchor_reliability,
 )
 from range_gdc.range_main_batch import npy_map, select_scene_ids
 from range_gdc.range_projection import range_to_velo
@@ -318,10 +317,7 @@ class PaperPipelineTests(unittest.TestCase):
                 "split_file": str(split), "data_tag": "unit",
                 "range_anchor": {"mode": "shared_canonical", "selected_rows": [1]},
                 "anchor": {"mode": "shared_canonical", "selected_rows": [1]},
-                "range_gdc": {
-                    "lambda_anchor": 123.0,
-                    "anchor_reliability_mode": "quadratic",
-                },
+                "range_gdc": {"lambda_anchor": 123.0},
             }
             args = type("Args", (), {"config": str(root / "config.yaml"), "threads": 1, "data_tag": None, "output_root": None,
                 "kitti_root": None, "split_file": None, "sdn_config": None, "sdn_checkpoint": None,
@@ -334,9 +330,8 @@ class PaperPipelineTests(unittest.TestCase):
             commands = pipeline.build_stages(context)["range_gdc"].commands_fn()[0]
             self.assertIn("--lambda_anchor", commands)
             self.assertEqual(commands[commands.index("--lambda_anchor") + 1], "123.0")
-            self.assertEqual(
-                commands[commands.index("--anchor_reliability_mode") + 1], "quadratic"
-            )
+            self.assertNotIn("--anchor_reliability_mode", commands)
+            self.assertNotIn("--anchor_reliability_scale", commands)
             self.assertNotIn("--selection_mode", commands)
             self.assertNotIn("--ablation_mode", commands)
 
@@ -364,7 +359,7 @@ class PaperPipelineTests(unittest.TestCase):
             self.assertTrue(command[1].endswith("range_gdc/build_range_anchor.py"))
             self.assertNotIn("--mode", command)
 
-    def test_single_pipeline_config_is_canonical_uniform(self):
+    def test_single_pipeline_config_is_canonical_graph_only(self):
         root = Path(__file__).parents[1]
         pipeline_configs = sorted((root / "configs").glob("r64_pipeline*.yaml"))
         self.assertEqual([path.name for path in pipeline_configs], ["r64_pipeline.yaml"])
@@ -373,12 +368,14 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(config["kitti_root"], "/data/kitti/kitti_object/training")
         self.assertEqual(range_cfg["neighbor"], "angular_grid8")
         self.assertEqual(range_cfg["lambda_anchor"], 300.0)
-        self.assertEqual(range_cfg["anchor_reliability_mode"], "uniform")
+        self.assertNotIn("anchor_reliability_mode", range_cfg)
+        self.assertNotIn("anchor_reliability_scale", range_cfg)
+        self.assertEqual(config["anchor_filter"]["abs_error_thr"], 2.0)
         self.assertNotIn("source_ptc_path", config["anchor"])
         for name in ("selection_mode", "confidence_mode", "transfer_k", "ablation_mode"):
             self.assertNotIn(name, range_cfg)
 
-    def test_pipeline_cli_overrides_split_output_and_reliability(self):
+    def test_pipeline_cli_overrides_split_output_and_kitti_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_split = root / "val.txt"
@@ -393,54 +390,38 @@ class PaperPipelineTests(unittest.TestCase):
                 "anchor": {"mode": "shared_canonical", "selected_rows": [5, 7, 9, 11]},
                 "range_anchor": {"mode": "shared_canonical", "selected_rows": [5, 7, 9, 11]},
                 "range_gdc": {
-                    "anchor_reliability_mode": "uniform",
                     "lambda_anchor": 300.0,
                     "lambda_prior": 0.1,
                     "lambda_smooth": 1.0,
                 },
             }
 
-            def make_args(mode):
-                return type("Args", (), {
-                    "config": "unused.yaml", "threads": None, "data_tag": None,
-                    "output_root": str(root / "cli-output"),
-                    "kitti_root": "/data/kitti/kitti_object/training",
-                    "split_file": str(override_split), "anchor_reliability_mode": mode,
-                    "sdn_config": None, "sdn_checkpoint": None,
-                    "no_distance_eval": True,
-                })()
-
-            contexts = []
-            for mode in ("uniform", "quadratic"):
-                with mock.patch.object(pipeline, "load_yaml", return_value=cfg), \
-                        mock.patch.object(pipeline, "read_split_ids", return_value=["000001"]):
-                    contexts.append(pipeline.build_context(make_args(mode)))
-            uniform, quadratic = contexts
-            self.assertEqual(quadratic["paths"]["output_root"], root / "cli-output")
-            self.assertEqual(quadratic["paths"]["split_file"], override_split)
-            self.assertEqual(quadratic["data_tag"], "train_1000_seed2026")
-            self.assertEqual(quadratic["range_gdc"]["anchor_reliability_mode"], "quadratic")
+            args = type("Args", (), {
+                "config": "unused.yaml", "threads": None, "data_tag": None,
+                "output_root": str(root / "cli-output"),
+                "kitti_root": "/data/kitti/kitti_object/training",
+                "split_file": str(override_split),
+                "sdn_config": None, "sdn_checkpoint": None,
+                "no_distance_eval": True,
+            })()
+            with mock.patch.object(pipeline, "load_yaml", return_value=cfg), \
+                    mock.patch.object(pipeline, "read_split_ids", return_value=["000001"]):
+                context = pipeline.build_context(args)
+            self.assertEqual(context["paths"]["output_root"], root / "cli-output")
+            self.assertEqual(context["paths"]["split_file"], override_split)
+            self.assertEqual(context["data_tag"], "train_1000_seed2026")
             self.assertEqual(
-                quadratic["paths"]["velodyne"],
+                context["paths"]["velodyne"],
                 Path("/data/kitti/kitti_object/training/velodyne"),
             )
-
-            uniform_params = dict(uniform["range_gdc"])
-            quadratic_params = dict(quadratic["range_gdc"])
-            uniform_params.pop("anchor_reliability_mode")
-            quadratic_params.pop("anchor_reliability_mode")
-            self.assertEqual(uniform_params, quadratic_params)
-
-            quadratic["args"] = make_args("quadratic")
-            commands = pipeline.build_stages(quadratic)
+            context["args"] = args
+            commands = pipeline.build_stages(context)
             anchor_command = commands["canonical_shared_anchor"].commands_fn()[0]
             range_command = commands["range_gdc"].commands_fn()[0]
             self.assertIn("/data/kitti/kitti_object/training/velodyne", anchor_command)
             self.assertNotIn("/data/kitti/kitti_object/testing/velodyne", anchor_command)
-            self.assertEqual(
-                range_command[range_command.index("--anchor_reliability_mode") + 1],
-                "quadratic",
-            )
+            self.assertNotIn("--anchor_reliability_mode", range_command)
+            self.assertNotIn("--anchor_reliability_scale", range_command)
 
     def test_legacy_anchor_source_path_fails_fast(self):
         cfg = {
@@ -453,8 +434,7 @@ class PaperPipelineTests(unittest.TestCase):
         args = type("Args", (), {
             "config": "unused.yaml", "threads": 1, "data_tag": None,
             "output_root": None, "kitti_root": None, "split_file": None,
-            "anchor_reliability_mode": None, "sdn_config": None,
-            "sdn_checkpoint": None, "no_distance_eval": True,
+            "sdn_config": None, "sdn_checkpoint": None, "no_distance_eval": True,
         })()
         with mock.patch.object(pipeline, "load_yaml", return_value=cfg):
             with self.assertRaisesRegex(ValueError, "source_ptc_path is no longer supported"):
@@ -490,7 +470,7 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(stats["anchor_forced_count"], 1)
         self.assertEqual(corrected[1, 2], anchor[1, 2])
 
-    def test_uniform_target_weights_preserve_graph_system_exactly(self):
+    def test_target_weights_none_matches_all_ones_exactly(self):
         L = sparse.csr_matrix(
             np.array([[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]])
         )
@@ -506,35 +486,24 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertTrue(np.array_equal(baseline_A.toarray(), uniform_A.toarray()))
         self.assertTrue(np.array_equal(baseline_b, uniform_b))
 
-    def test_default_and_explicit_uniform_are_exactly_equivalent(self):
+    def test_canonical_graph_uses_equal_anchor_weights_and_exact_force(self):
         guide = np.full((4, 5), 10.0, dtype=np.float32)
         anchor = np.zeros_like(guide)
         anchor[0, 0], anchor[1, 1], anchor[2, 3], anchor[3, 4] = 10.0, 10.5, 11.0, 11.5
-        baseline = RangeROIGDC(
+        corrected, mask, stats, debug = RangeROIGDC(
             guide, anchor, method="spsolve", return_stats=True, return_debug=True,
         )
-        uniform = RangeROIGDC(
-            guide, anchor, method="spsolve", anchor_reliability_mode="uniform",
-            return_stats=True, return_debug=True,
+        self.assertEqual(stats["N_residual_targets"], 4)
+        self.assertEqual(stats["anchor_forced_count"], 4)
+        self.assertTrue(np.array_equal(corrected[debug["force_mask"]], anchor[debug["force_mask"]]))
+        self.assertTrue(np.array_equal(mask, np.ones_like(mask, dtype=bool)))
+        expected_A, expected_b = build_graph_residual_system(
+            debug["L"], debug["target_node_indices"], debug["target_delta"],
+            lambda_anchor=300.0, lambda_prior=0.1, lambda_smooth=1.0,
+            target_weights=np.ones(debug["target_node_indices"].shape),
         )
-        self.assertTrue(np.array_equal(baseline[0], uniform[0]))
-        self.assertTrue(np.array_equal(baseline[1], uniform[1]))
-        self.assertTrue(np.array_equal(baseline[3]["A"].toarray(), uniform[3]["A"].toarray()))
-        self.assertTrue(np.array_equal(baseline[3]["b"], uniform[3]["b"]))
-        self.assertTrue(np.array_equal(uniform[3]["target_weights"], np.ones(4)))
-
-    def test_quadratic_anchor_reliability_formula_and_rejection_boundary(self):
-        guide = np.full((1, 5), 10.0, dtype=np.float64)
-        anchor = guide + np.array([[0.0, 0.5, 1.0, 1.5, 2.0]])
-        accepted, rejected = _apply_anchor_reject(
-            np.ones_like(guide, dtype=bool), guide, anchor, "abs", 0.4, 2.0,
-        )
-        weights = compute_anchor_reliability(
-            accepted, guide, anchor, anchor_reject="abs", log_ratio_thr=0.4,
-            abs_error_thr=2.0, anchor_reliability_mode="quadratic",
-        )
-        self.assertEqual(rejected, 1)
-        np.testing.assert_allclose(weights, [1.0, 0.9375, 0.75, 0.4375], rtol=0, atol=0)
+        self.assertTrue(np.array_equal(debug["A"].toarray(), expected_A.toarray()))
+        self.assertTrue(np.array_equal(debug["b"], expected_b))
 
     def test_weighted_anchor_constraint_uses_effective_lambda(self):
         L = sparse.csr_matrix((2, 2), dtype=np.float64)
@@ -551,49 +520,7 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(uniform_A[1, 1], 300.1)
         self.assertEqual(uniform_b[1], 75.0)
 
-    def test_quadratic_reliability_keeps_accepted_anchor_force_exact(self):
-        guide = np.full((2, 3), 10.0, dtype=np.float32)
-        anchor = np.zeros_like(guide)
-        anchor[0, 0] = 11.5
-        corrected, _, stats, debug = RangeROIGDC(
-            guide, anchor, method="spsolve", anchor_reject="abs", abs_error_thr=2.0,
-            anchor_reliability_mode="quadratic", anchor_force_policy="accepted_only",
-            return_stats=True, return_debug=True,
-        )
-        self.assertLess(debug["target_weights"][0], 1.0)
-        self.assertIn("target_discrepancy", debug)
-        self.assertIn("target_normalized_discrepancy", debug)
-        self.assertEqual(stats["anchor_reliability_mode"], "quadratic")
-        self.assertEqual(stats["effective_anchor_lambda_min"], 131.25)
-        self.assertEqual(corrected[0, 0], anchor[0, 0])
-        self.assertEqual(stats["anchor_forced_count"], 1)
-
-    def test_quadratic_changes_only_non_anchor_propagation_strength(self):
-        guide = np.full((2, 3), 10.0, dtype=np.float32)
-        anchor = np.zeros_like(guide)
-        anchor[0, 0] = 11.5
-        common = dict(
-            method="spsolve", anchor_reject="abs", abs_error_thr=2.0,
-            lambda_anchor=3.0, sigma_angular=10.0, anchor_force_policy="accepted_only",
-            return_stats=True, return_debug=True,
-        )
-        uniform = RangeROIGDC(guide, anchor, anchor_reliability_mode="uniform", **common)
-        quadratic = RangeROIGDC(guide, anchor, anchor_reliability_mode="quadratic", **common)
-        self.assertTrue(np.array_equal(uniform[1], quadratic[1]))
-        self.assertTrue(np.array_equal(uniform[3]["target_mask"], quadratic[3]["target_mask"]))
-        self.assertTrue(np.array_equal(uniform[3]["force_mask"], quadratic[3]["force_mask"]))
-        non_anchor = ~uniform[3]["target_mask"]
-        self.assertGreater(
-            float(np.max(np.abs(uniform[0][non_anchor] - quadratic[0][non_anchor]))), 0.0
-        )
-
-    def test_invalid_anchor_reliability_inputs_raise(self):
-        guide = np.array([[10.0]], dtype=np.float32)
-        anchor = np.array([[10.5]], dtype=np.float32)
-        with self.assertRaisesRegex(ValueError, "requires anchor_reject"):
-            RangeROIGDC(
-                guide, anchor, anchor_reject="none", anchor_reliability_mode="quadratic"
-            )
+    def test_invalid_generic_target_weights_raise(self):
         L = sparse.csr_matrix((2, 2), dtype=np.float64)
         invalid_weights = (
             np.array([-0.1]), np.array([1.1]), np.array([np.nan]),
@@ -640,7 +567,6 @@ class PaperPipelineTests(unittest.TestCase):
             "anchor_reject": "none",
             "log_ratio_thr": 0.4,
             "abs_error_thr": 2.0,
-            "anchor_reliability_mode": "uniform",
             "lambda_anchor": 300.0,
             "lambda_prior": 0.1,
             "lambda_smooth": 1.0,
@@ -671,7 +597,8 @@ class PaperPipelineTests(unittest.TestCase):
                 pred, anchor,
                 method=args["method"], range_min=args["range_min"], range_max=args["range_max"],
                 anchor_reject=args["anchor_reject"], log_ratio_thr=args["log_ratio_thr"],
-                abs_error_thr=args["abs_error_thr"], lambda_anchor=args["lambda_anchor"],
+                abs_error_thr=args["abs_error_thr"],
+                lambda_anchor=args["lambda_anchor"],
                 lambda_prior=args["lambda_prior"], lambda_smooth=args["lambda_smooth"],
                 neighbor=args["neighbor"], edge_spatial_mode=args["edge_spatial_mode"],
                 sigma_angular=args["sigma_angular"], sigma_tangent=args["sigma_tangent"],

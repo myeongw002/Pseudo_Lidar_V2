@@ -30,31 +30,6 @@ residual clipping, and `accepted_only` anchor forcing follow the checked-in
 canonical configuration. It corrects existing predicted cells only and does
 not complete missing cells.
 
-## Experimental continuous anchor reliability
-
-The canonical config explicitly uses `anchor_reliability_mode: uniform`, so
-every anchor accepted by hard rejection has `q = 1` and retains the baseline
-system exactly. Quadratic mode is selected with a CLI override: after the same
-hard rejection, each accepted anchor receives
-`q = 1 - (d / tau)^2` for `d < tau`; anchors with `d >= tau` have `q = 0`
-and are removed from the graph target set by hard rejection. Each accepted
-anchor's graph constraint becomes `lambda_anchor * q`. Here `d` is the
-unclipped absolute range discrepancy for
-`abs` rejection, or the unclipped absolute log-range discrepancy for
-`log_ratio`; `tau` is the corresponding rejection threshold. Quadratic mode
-cannot be combined with `anchor_reject: none`. Graph edge weights, residual
-clipping, accepted-target residual reinsertion, and accepted-anchor forcing
-are unchanged. This mode does not add a direct residual branch or a separate
-target-cell/cell-level confidence path.
-
-```bash
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline.yaml \
-  --split-file ./split/train_1000_seed2026.txt \
-  --output-root /data/kitti/pseudo_lidar_anchor_reliability_train1000 \
-  --anchor-reliability-mode quadratic
-```
-
 ## Canonical stages
 
 ```text
@@ -84,24 +59,13 @@ python3 -B tools/run_range_gdc_experiment.py \
   --config configs/r64_pipeline.yaml
 ```
 
-Train-1000 uniform control:
+Train-1000 run:
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
   --config configs/r64_pipeline.yaml \
   --split-file ./split/train_1000_seed2026.txt \
-  --output-root /data/kitti/pseudo_lidar_uniform_train1000 \
-  --anchor-reliability-mode uniform
-```
-
-Train-1000 quadratic experiment:
-
-```bash
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline.yaml \
-  --split-file ./split/train_1000_seed2026.txt \
-  --output-root /data/kitti/pseudo_lidar_anchor_reliability_train1000 \
-  --anchor-reliability-mode quadratic
+  --output-root /data/kitti/pseudo_lidar_range_gdc_train1000
 ```
 
 The runner derives the canonical LiDAR source from `kitti_root/velodyne`;

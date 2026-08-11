@@ -37,8 +37,8 @@ The single Range-GDC pipeline configuration is:
 
 - `configs/r64_pipeline.yaml`
 
-Split, output root, KITTI root, and anchor reliability experiments use CLI
-overrides instead of copied YAML files.
+Split, output root, and KITTI root changes use CLI overrides instead of copied
+YAML files.
 
 Major outputs live below the configured `output_root`, notably
 `anchor/shared_canonical_pointcloud/`,

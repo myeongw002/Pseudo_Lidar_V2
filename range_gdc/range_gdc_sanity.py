@@ -170,14 +170,17 @@ def test_legacy_api_and_cli_removed():
     parameters = inspect.signature(RangeROIGDC).parameters
     for name in (
         "transfer_k", "confidence_mode", "selection_mode", "ablation_mode",
-        "force_anchor_value",
+        "force_anchor_value", "anchor_reliability_mode", "anchor_reliability_scale",
     ):
         assert name not in parameters
     result = subprocess.run(
         [sys.executable, "-m", "range_gdc.range_main_batch", "--help"],
         check=True, capture_output=True, text=True,
     )
-    for flag in ("transfer_k", "confidence_mode", "selection_mode", "ablation_mode", "force_anchor_value"):
+    for flag in (
+        "transfer_k", "confidence_mode", "selection_mode", "ablation_mode",
+        "force_anchor_value", "anchor_reliability_mode", "anchor_reliability_scale",
+    ):
         assert flag not in result.stdout
 
 

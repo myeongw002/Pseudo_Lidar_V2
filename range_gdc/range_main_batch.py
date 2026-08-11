@@ -35,21 +35,6 @@ STATS_FIELDNAMES = [
     "anchor_reject_count",
     "anchor_reject_ratio",
     "anchor_reject_mode",
-    "anchor_reliability_mode",
-    "anchor_reliability_mean",
-    "anchor_reliability_std",
-    "anchor_reliability_min",
-    "anchor_reliability_max",
-    "anchor_reliability_median",
-    "anchor_reliability_p10",
-    "anchor_reliability_p90",
-    "anchor_reliability_lt_025_ratio",
-    "anchor_reliability_025_050_ratio",
-    "anchor_reliability_050_075_ratio",
-    "anchor_reliability_ge_075_ratio",
-    "effective_anchor_lambda_mean",
-    "effective_anchor_lambda_min",
-    "effective_anchor_lambda_max",
     "anchor_force_policy",
     "anchor_forced_count",
     "output_valid_count",
@@ -278,7 +263,6 @@ def process_one(task):
         anchor_reject=args_dict["anchor_reject"],
         log_ratio_thr=args_dict["log_ratio_thr"],
         abs_error_thr=args_dict["abs_error_thr"],
-        anchor_reliability_mode=args_dict.get("anchor_reliability_mode", "uniform"),
         lambda_anchor=args_dict["lambda_anchor"],
         lambda_prior=args_dict["lambda_prior"],
         lambda_smooth=args_dict["lambda_smooth"],
@@ -337,11 +321,6 @@ def parse_args():
     parser.add_argument("--anchor_reject", choices=["log_ratio", "abs", "none"], default="abs")
     parser.add_argument("--log_ratio_thr", type=float, default=0.4)
     parser.add_argument("--abs_error_thr", type=float, default=2.0)
-    parser.add_argument(
-        "--anchor_reliability_mode",
-        choices=["uniform", "quadratic"],
-        default="uniform",
-    )
     parser.add_argument("--lambda_anchor", type=float, default=300.0)
     parser.add_argument("--lambda_prior", type=float, default=0.1)
     parser.add_argument("--lambda_smooth", type=float, default=1.0)
@@ -385,8 +364,6 @@ def validate_args(args):
         raise ValueError("--max_log_range_diff must be positive when set")
     if args.delta_clip is not None and args.delta_clip <= 0:
         raise ValueError("--delta_clip must be positive when set")
-    if args.anchor_reliability_mode == "quadratic" and args.anchor_reject == "none":
-        raise ValueError("--anchor_reliability_mode quadratic requires hard anchor rejection")
 
 
 def main():
@@ -439,7 +416,6 @@ def main():
     print(f"output_path       : {args.output_path}")
     print(f"mask_output_path  : {args.mask_output_path}")
     print(f"method            : {args.method}")
-    print(f"anchor_reliability_mode: {args.anchor_reliability_mode}")
     print(f"neighbor          : {args.neighbor}")
     print(f"edge_spatial_mode : {args.edge_spatial_mode}")
     print(f"threads           : {args.threads}")

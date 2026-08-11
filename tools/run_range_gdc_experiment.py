@@ -433,13 +433,6 @@ def build_context(args):
         raise ValueError("anchor.selected_rows and range_anchor.selected_rows must define the same canonical source rows")
 
     range_cfg = dict(cfg.get("range_gdc", {}))
-    reliability_mode = (
-        getattr(args, "anchor_reliability_mode", None)
-        or range_cfg.get("anchor_reliability_mode", "uniform")
-    )
-    if reliability_mode not in {"uniform", "quadratic"}:
-        raise ValueError("anchor_reliability_mode must be uniform or quadratic")
-    range_cfg["anchor_reliability_mode"] = reliability_mode
     projection_cfg = dict(range_cfg.get("projection", {}))
     projection = {
         "height": int(projection_cfg.get("height", projection_cfg.get("range_h", RANGE_H))),
@@ -794,8 +787,7 @@ def build_stages(ctx):
             "--anchor_force_policy", str(anchor_filter.get("force_policy", rgdc.get("anchor_force_policy", "accepted_only"))),
         ]
         for name in (
-            "method", "range_min", "range_max", "anchor_reliability_mode",
-            "lambda_anchor", "lambda_prior",
+            "method", "range_min", "range_max", "lambda_anchor", "lambda_prior",
             "lambda_smooth", "neighbor", "edge_spatial_mode", "sigma_angular",
             "sigma_tangent", "sigma_log_range", "max_log_range_diff", "delta_clip",
         ):
@@ -1139,11 +1131,6 @@ def parse_args():
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--kitti-root", default=None)
     parser.add_argument("--split-file", default=None)
-    parser.add_argument(
-        "--anchor-reliability-mode",
-        choices=["uniform", "quadratic"],
-        default=None,
-    )
     parser.add_argument("--data-tag", default=None)
     parser.add_argument("--sdn-config", default=None)
     parser.add_argument("--sdn-checkpoint", default=None)
