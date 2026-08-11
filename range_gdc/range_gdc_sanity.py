@@ -169,8 +169,7 @@ def test_cg_and_spsolve_sanity():
 def test_legacy_api_and_cli_removed():
     parameters = inspect.signature(RangeROIGDC).parameters
     for name in (
-        "transfer_k", "confidence_mode", "selection_mode", "ablation_mode",
-        "force_anchor_value", "anchor_reliability_mode", "anchor_reliability_scale",
+        "transfer_k", "selection_mode", "ablation_mode", "force_anchor_value",
     ):
         assert name not in parameters
     result = subprocess.run(
@@ -178,8 +177,7 @@ def test_legacy_api_and_cli_removed():
         check=True, capture_output=True, text=True,
     )
     for flag in (
-        "transfer_k", "confidence_mode", "selection_mode", "ablation_mode",
-        "force_anchor_value", "anchor_reliability_mode", "anchor_reliability_scale",
+        "transfer_k", "selection_mode", "ablation_mode", "force_anchor_value",
     ):
         assert flag not in result.stdout
 

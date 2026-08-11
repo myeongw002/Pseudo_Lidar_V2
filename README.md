@@ -48,11 +48,6 @@ Major outputs live below the configured `output_root`, notably
 [the canonical experiment guide](docs/range_gdc_experiment_usage.md) for stage,
 audit, and output details.
 
-The GT-only anchor-weight headroom experiment is deliberately separate from the
-canonical pipeline. See
-[the Oracle diagnostic guide](docs/oracle_anchor_reliability.md) for its
-train1000-only command and leakage safeguards.
-
 ## Upstream Pseudo-LiDAR++
 
 The original Pseudo-LiDAR++ project and attribution are retained below.

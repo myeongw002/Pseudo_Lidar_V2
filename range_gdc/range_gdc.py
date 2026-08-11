@@ -275,7 +275,6 @@ def build_graph_residual_system(
     lambda_anchor=300.0,
     lambda_prior=0.05,
     lambda_smooth=1.0,
-    target_weights=None,
 ):
     N = L.shape[0]
     if L.shape != (N, N):
@@ -289,31 +288,18 @@ def build_graph_residual_system(
 
     target_node_indices = np.asarray(target_node_indices, dtype=np.int64)
     target_delta = np.asarray(target_delta, dtype=np.float64)
-    if target_weights is None:
-        target_weights = np.ones(target_node_indices.shape, dtype=np.float64)
-    else:
-        target_weights = np.asarray(target_weights, dtype=np.float64)
-        if target_weights.ndim != 1:
-            raise ValueError("target_weights must be 1D")
-        if target_weights.shape != target_node_indices.shape:
-            raise ValueError("target_weights shape must match target_node_indices")
-        if not np.all(np.isfinite(target_weights)):
-            raise ValueError("target_weights must be finite")
-        if np.any(target_weights < 0.0) or np.any(target_weights > 1.0):
-            raise ValueError("target_weights must be within [0, 1]")
     if target_node_indices.size:
         if target_delta.shape != target_node_indices.shape:
             raise ValueError("target_delta shape must match target_node_indices")
-        effective_lambda = float(lambda_anchor) * target_weights
         anchor_diag = sparse.csr_matrix(
             (
-                effective_lambda,
+                np.full(target_node_indices.shape, float(lambda_anchor), dtype=np.float64),
                 (target_node_indices, target_node_indices),
             ),
             shape=(N, N),
         )
         A = A + anchor_diag
-        b[target_node_indices] = effective_lambda * target_delta
+        b[target_node_indices] = float(lambda_anchor) * target_delta
 
     return A.tocsr(), b
 
@@ -339,7 +325,6 @@ def _solve_graph_delta(
     lambda_anchor,
     lambda_prior,
     lambda_smooth,
-    target_weights=None,
 ):
     A, b = build_graph_residual_system(
         L,
@@ -348,7 +333,6 @@ def _solve_graph_delta(
         lambda_anchor=lambda_anchor,
         lambda_prior=lambda_prior,
         lambda_smooth=lambda_smooth,
-        target_weights=target_weights,
     )
     delta_graph, info = _solve_linear_system(A, b, method=method)
     system_residual = A @ delta_graph - b
@@ -380,17 +364,11 @@ def RangeROIGDC(
     max_log_range_diff=None,
     delta_clip=0.3,
     anchor_force_policy="accepted_only",
-    target_weights=None,
     return_debug=False,
     return_stats=False,
     verbose=False,
 ):
-    """Graph-regularized log-range residual correction on guide-valid bins.
-
-    Optional ``target_weights`` align with the row-major accepted-anchor order
-    and scale only graph data constraints. Anchor rejection and post-solve force
-    semantics are independent of these generic weights.
-    """
+    """Graph-regularized log-range residual correction on guide-valid bins."""
     del verbose
     t0 = time.perf_counter()
     guide_range = np.asarray(pred_range, dtype=np.float32)
@@ -551,7 +529,6 @@ def RangeROIGDC(
         L, target_node_indices, target_delta, method=method,
         lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
         lambda_smooth=lambda_smooth,
-        target_weights=target_weights,
     )
     if delta_clip is not None:
         delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
@@ -636,11 +613,6 @@ def RangeROIGDC(
             "delta_final": delta_final,
             "target_node_indices": target_node_indices,
             "target_delta": target_delta,
-            "target_weights": (
-                np.ones(target_node_indices.shape, dtype=np.float64)
-                if target_weights is None
-                else np.asarray(target_weights, dtype=np.float64)
-            ),
             "guide_valid": guide_valid,
             "target_mask": target_mask,
             "force_mask": force_mask,

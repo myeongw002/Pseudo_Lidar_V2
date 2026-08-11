@@ -24,7 +24,6 @@ from range_gdc.shared_canonical_anchor import (
 from ptc2depthmap import get_depth_map
 from gdc import anchor_accept_mask
 from tools import run_range_gdc_experiment as pipeline
-from tools import oracle_anchor_reliability as oracle
 from tools.audit_shared_anchor_protocol import audit_frame, aggregate_audit
 from tools.audit_anchor_rejection_consistency import (
     common_source_locations, frame_point_rows, rejection_category, source_locations,
@@ -331,8 +330,6 @@ class PaperPipelineTests(unittest.TestCase):
             commands = pipeline.build_stages(context)["range_gdc"].commands_fn()[0]
             self.assertIn("--lambda_anchor", commands)
             self.assertEqual(commands[commands.index("--lambda_anchor") + 1], "123.0")
-            self.assertNotIn("--anchor_reliability_mode", commands)
-            self.assertNotIn("--anchor_reliability_scale", commands)
             self.assertNotIn("--selection_mode", commands)
             self.assertNotIn("--ablation_mode", commands)
 
@@ -369,11 +366,9 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(config["kitti_root"], "/data/kitti/kitti_object/training")
         self.assertEqual(range_cfg["neighbor"], "angular_grid8")
         self.assertEqual(range_cfg["lambda_anchor"], 300.0)
-        self.assertNotIn("anchor_reliability_mode", range_cfg)
-        self.assertNotIn("anchor_reliability_scale", range_cfg)
         self.assertEqual(config["anchor_filter"]["abs_error_thr"], 2.0)
         self.assertNotIn("source_ptc_path", config["anchor"])
-        for name in ("selection_mode", "confidence_mode", "transfer_k", "ablation_mode"):
+        for name in ("selection_mode", "transfer_k", "ablation_mode"):
             self.assertNotIn(name, range_cfg)
 
     def test_pipeline_cli_overrides_split_output_and_kitti_root(self):
@@ -421,8 +416,6 @@ class PaperPipelineTests(unittest.TestCase):
             range_command = commands["range_gdc"].commands_fn()[0]
             self.assertIn("/data/kitti/kitti_object/training/velodyne", anchor_command)
             self.assertNotIn("/data/kitti/kitti_object/testing/velodyne", anchor_command)
-            self.assertNotIn("--anchor_reliability_mode", range_command)
-            self.assertNotIn("--anchor_reliability_scale", range_command)
 
     def test_legacy_anchor_source_path_fails_fast(self):
         cfg = {
@@ -471,21 +464,21 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(stats["anchor_forced_count"], 1)
         self.assertEqual(corrected[1, 2], anchor[1, 2])
 
-    def test_target_weights_none_matches_all_ones_exactly(self):
+    def test_equal_weight_graph_system_is_constructed_exactly(self):
         L = sparse.csr_matrix(
             np.array([[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]])
         )
         targets = np.array([0, 2])
         delta = np.array([0.25, -0.1])
-        baseline_A, baseline_b = build_graph_residual_system(
-            L, targets, delta, lambda_anchor=300.0, lambda_prior=0.1
-        )
-        uniform_A, uniform_b = build_graph_residual_system(
+        actual_A, actual_b = build_graph_residual_system(
             L, targets, delta, lambda_anchor=300.0, lambda_prior=0.1,
-            target_weights=np.ones(2),
+            lambda_smooth=2.0,
         )
-        self.assertTrue(np.array_equal(baseline_A.toarray(), uniform_A.toarray()))
-        self.assertTrue(np.array_equal(baseline_b, uniform_b))
+        expected_A = 0.1 * np.eye(3) + 2.0 * L.toarray()
+        expected_A[[0, 2], [0, 2]] += 300.0
+        expected_b = np.array([75.0, 0.0, -30.0])
+        self.assertTrue(np.array_equal(actual_A.toarray(), expected_A))
+        self.assertTrue(np.array_equal(actual_b, expected_b))
 
     def test_canonical_graph_uses_equal_anchor_weights_and_exact_force(self):
         guide = np.full((4, 5), 10.0, dtype=np.float32)
@@ -501,186 +494,22 @@ class PaperPipelineTests(unittest.TestCase):
         expected_A, expected_b = build_graph_residual_system(
             debug["L"], debug["target_node_indices"], debug["target_delta"],
             lambda_anchor=300.0, lambda_prior=0.1, lambda_smooth=1.0,
-            target_weights=np.ones(debug["target_node_indices"].shape),
         )
         self.assertTrue(np.array_equal(debug["A"].toarray(), expected_A.toarray()))
         self.assertTrue(np.array_equal(debug["b"], expected_b))
 
-    def test_weighted_anchor_constraint_uses_effective_lambda(self):
-        L = sparse.csr_matrix((2, 2), dtype=np.float64)
-        weighted_A, weighted_b = build_graph_residual_system(
-            L, np.array([1]), np.array([0.25]), lambda_anchor=300.0,
-            lambda_prior=0.1, target_weights=np.array([0.5]),
-        )
-        uniform_A, uniform_b = build_graph_residual_system(
-            L, np.array([1]), np.array([0.25]), lambda_anchor=300.0,
-            lambda_prior=0.1, target_weights=np.array([1.0]),
-        )
-        self.assertEqual(weighted_A[1, 1], 150.1)
-        self.assertEqual(weighted_b[1], 37.5)
-        self.assertEqual(uniform_A[1, 1], 300.1)
-        self.assertEqual(uniform_b[1], 75.0)
-
-    def test_invalid_generic_target_weights_raise(self):
-        L = sparse.csr_matrix((2, 2), dtype=np.float64)
-        invalid_weights = (
-            np.array([-0.1]), np.array([1.1]), np.array([np.nan]),
-            np.array([[0.5]]), np.array([0.5, 0.5]),
-        )
-        for weights in invalid_weights:
-            with self.subTest(weights=weights):
-                with self.assertRaises(ValueError):
-                    build_graph_residual_system(
-                        L, np.array([1]), np.array([0.25]), target_weights=weights,
-                    )
-
-    def test_oracle_all_one_weights_exactly_match_canonical_uniform(self):
+    def test_range_gdc_equal_weight_output_is_deterministic(self):
         guide, anchor = self.correction_fixture()
-        uniform, uniform_mask, _, uniform_debug = RangeROIGDC(
+        first = RangeROIGDC(
             guide, anchor, method="spsolve", return_stats=True, return_debug=True,
         )
-        weighted, weighted_mask, _, weighted_debug = RangeROIGDC(
-            guide, anchor, method="spsolve",
-            target_weights=np.ones(uniform_debug["target_node_indices"].shape),
-            return_stats=True, return_debug=True,
-        )
-        self.assertTrue(np.array_equal(uniform, weighted))
-        self.assertTrue(np.array_equal(uniform_mask, weighted_mask))
-        self.assertTrue(np.array_equal(uniform_debug["target_mask"], weighted_debug["target_mask"]))
-        self.assertTrue(np.array_equal(uniform_debug["force_mask"], weighted_debug["force_mask"]))
-        self.assertEqual((uniform_debug["A"] != weighted_debug["A"]).nnz, 0)
-        self.assertTrue(np.array_equal(uniform_debug["b"], weighted_debug["b"]))
-
-    def test_oracle_weights_preserve_masks_nodes_edges_and_force(self):
-        guide, anchor = self.correction_fixture()
-        _, _, _, baseline = RangeROIGDC(
+        second = RangeROIGDC(
             guide, anchor, method="spsolve", return_stats=True, return_debug=True,
         )
-        corrected, _, _, pruned = RangeROIGDC(
-            guide, anchor, method="spsolve", target_weights=np.zeros(1),
-            return_stats=True, return_debug=True,
-        )
-        self.assertTrue(np.array_equal(baseline["target_mask"], pruned["target_mask"]))
-        self.assertTrue(np.array_equal(baseline["force_mask"], pruned["force_mask"]))
-        self.assertTrue(np.array_equal(baseline["node_rows"], pruned["node_rows"]))
-        self.assertTrue(np.array_equal(baseline["edge_i"], pruned["edge_i"]))
-        self.assertTrue(np.array_equal(baseline["edge_j"], pruned["edge_j"]))
-        self.assertTrue(np.array_equal(baseline["edge_weight"], pruned["edge_weight"]))
-        self.assertEqual(corrected[1, 2], anchor[1, 2])
-
-    def test_oracle_zero_weight_removes_only_graph_anchor_constraint(self):
-        guide, anchor = self.correction_fixture()
-        _, _, _, uniform = RangeROIGDC(
-            guide, anchor, method="spsolve", target_weights=np.ones(1),
-            return_stats=True, return_debug=True,
-        )
-        _, _, _, zero = RangeROIGDC(
-            guide, anchor, method="spsolve", target_weights=np.zeros(1),
-            return_stats=True, return_debug=True,
-        )
-        node = int(uniform["target_node_indices"][0])
-        difference = uniform["A"] - zero["A"]
-        expected = sparse.csr_matrix(
-            ([300.0], ([node], [node])), shape=uniform["A"].shape
-        )
-        self.assertEqual((difference != expected).nnz, 0)
-        self.assertEqual(uniform["b"][node] - zero["b"][node], 300.0 * uniform["target_delta"][0])
-
-    @staticmethod
-    def oracle_score_fixture(gt_values):
-        guide = np.full((3, 3), 10.0, dtype=np.float32)
-        anchor = np.zeros_like(guide)
-        anchor[1, 1] = 11.0
-        _, _, _, debug = RangeROIGDC(
-            guide, anchor, method="spsolve", return_stats=True, return_debug=True,
-            sigma_angular=10.0,
-        )
-        gt = np.asarray(gt_values, dtype=np.float32)
-        return oracle.compute_oracle_badness(
-            guide, gt, [1], debug, delta_clip=0.3,
-        )
-
-    def test_oracle_source_rows_are_never_hidden_targets(self):
-        gt = np.zeros((3, 3), dtype=np.float32)
-        gt[1, :] = 10.0
-        badness, count, known = self.oracle_score_fixture(gt)
-        self.assertFalse(known[0])
-        self.assertEqual(count[0], 0)
-        self.assertTrue(np.isnan(badness[0]))
-
-    def test_oracle_invalid_gt_cells_are_excluded(self):
-        gt = np.zeros((3, 3), dtype=np.float32)
-        gt[0, 1] = np.nan
-        gt[2, 1] = 10.0
-        _, count, known = self.oracle_score_fixture(gt)
-        self.assertTrue(known[0])
-        self.assertGreaterEqual(count[0], 1)
-        self.assertLess(count[0], 6)
-
-    def test_oracle_unknown_anchor_keeps_unit_weight(self):
-        rows = [{
-            "frame_id": "000000", "anchor_row": 1, "anchor_col": 2,
-            "oracle_known": False, "oracle_badness": np.nan,
-        }]
-        weights, thresholds = oracle.rank_oracle_weights(rows)
-        for method, _ in oracle.KEEP_RATIOS:
-            self.assertEqual(weights[method][("000000", 1, 2)], 1.0)
-        self.assertEqual(thresholds[-1]["oracle_known_anchor_count"], 0)
-
-    def test_oracle_global_rank_thresholds_are_deterministic(self):
-        rows = [
-            {"frame_id": f"{index:06d}", "anchor_row": 1, "anchor_col": 0,
-             "oracle_known": True, "oracle_badness": score}
-            for index, score in enumerate([0.4, 0.1, 0.3, 0.2])
-        ]
-        first_weights, first_thresholds = oracle.rank_oracle_weights(rows)
-        second_weights, second_thresholds = oracle.rank_oracle_weights(list(reversed(rows)))
-        self.assertEqual(first_weights, second_weights)
-        self.assertEqual(first_thresholds, second_thresholds)
-        keep50 = next(row for row in first_thresholds if row["method"] == "oracle_keep50")
-        self.assertEqual(keep50["oracle_known_kept_count"], 2)
-        self.assertEqual(keep50["threshold_h"], 0.2)
-
-    def test_oracle_keep100_weights_are_all_one(self):
-        rows = [
-            {"frame_id": "000000", "anchor_row": 1, "anchor_col": index,
-             "oracle_known": True, "oracle_badness": float(index)}
-            for index in range(3)
-        ]
-        weights, _ = oracle.rank_oracle_weights(rows)
-        self.assertEqual(set(weights["uniform"].values()), {1.0})
-
-    def test_oracle_rejects_non_train1000_split(self):
-        with self.assertRaisesRegex(ValueError, "val/test oracle runs are forbidden"):
-            oracle.validate_train1000_split("split/val.txt")
-        oracle.validate_train1000_split("split/train_1000_seed2026.txt")
-
-    def test_oracle_output_root_must_be_disjoint_from_base(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with self.assertRaises(ValueError):
-                oracle.validate_diagnostic_roots(root, root / "oracle-output")
-            oracle.validate_diagnostic_roots(root / "base", root / "oracle-output")
-
-    def test_oracle_output_preparation_does_not_modify_base(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            base, output = root / "base", root / "output"
-            base.mkdir()
-            sentinel = base / "artifact.npy"
-            sentinel.write_bytes(b"canonical")
-            oracle.validate_diagnostic_roots(base, output)
-            oracle._prepare_output(output, overwrite=False)
-            self.assertEqual(sentinel.read_bytes(), b"canonical")
-
-    def test_oracle_gt_dependency_is_absent_from_canonical_runner_and_config(self):
-        root = Path(__file__).parents[1]
-        runner = (root / "tools" / "run_range_gdc_experiment.py").read_text()
-        batch = (root / "range_gdc" / "range_main_batch.py").read_text()
-        config = pipeline.load_yaml(root / "configs" / "r64_pipeline.yaml")
-        self.assertNotIn("--oracle", runner)
-        self.assertNotIn("target_weights", batch)
-        self.assertNotIn("oracle", config)
+        self.assertTrue(np.array_equal(first[0], second[0]))
+        self.assertTrue(np.array_equal(first[1], second[1]))
+        self.assertEqual((first[3]["A"] != second[3]["A"]).nnz, 0)
+        self.assertTrue(np.array_equal(first[3]["b"], second[3]["b"]))
 
     def test_spherical_projection_round_trip(self):
         points = np.array([[10.0, 0.0, 0.0], [8.0, 2.0, -1.0]], dtype=np.float32)

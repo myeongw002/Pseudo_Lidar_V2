@@ -1,0 +1,33 @@
+OUT=/data/kitti/rgc_lambda_metric_compare
+mkdir -p "$OUT"
+
+for LAMBDA in 1 3 10 30 100 300 1000; do
+    ROOT="/data/kitti/rgc_lambda${LAMBDA}_smoke10"
+
+    SUMMARY="$ROOT/metrics/guide_r64_summary.csv"
+    DISTANCE="$ROOT/metrics/guide_r64_distance_summary.csv"
+    STATS="$ROOT/range/range_gdc/meta/range_gdc_stats.csv"
+
+    if [ -f "$SUMMARY" ]; then
+        cp "$SUMMARY" "$OUT/lambda${LAMBDA}_summary.csv"
+        echo "[OK] lambda=$LAMBDA summary"
+    else
+        echo "[MISSING] $SUMMARY"
+    fi
+
+    if [ -f "$DISTANCE" ]; then
+        cp "$DISTANCE" "$OUT/lambda${LAMBDA}_distance_summary.csv"
+        echo "[OK] lambda=$LAMBDA distance_summary"
+    else
+        echo "[MISSING] $DISTANCE"
+    fi
+
+    if [ -f "$STATS" ]; then
+        cp "$STATS" "$OUT/lambda${LAMBDA}_range_gdc_stats.csv"
+        echo "[OK] lambda=$LAMBDA stats"
+    fi
+done
+
+echo
+echo "Collected:"
+ls -lh "$OUT"
