@@ -380,11 +380,17 @@ def RangeROIGDC(
     max_log_range_diff=None,
     delta_clip=0.3,
     anchor_force_policy="accepted_only",
+    target_weights=None,
     return_debug=False,
     return_stats=False,
     verbose=False,
 ):
-    """Graph-regularized log-range residual correction on guide-valid bins."""
+    """Graph-regularized log-range residual correction on guide-valid bins.
+
+    Optional ``target_weights`` align with the row-major accepted-anchor order
+    and scale only graph data constraints. Anchor rejection and post-solve force
+    semantics are independent of these generic weights.
+    """
     del verbose
     t0 = time.perf_counter()
     guide_range = np.asarray(pred_range, dtype=np.float32)
@@ -545,6 +551,7 @@ def RangeROIGDC(
         L, target_node_indices, target_delta, method=method,
         lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
         lambda_smooth=lambda_smooth,
+        target_weights=target_weights,
     )
     if delta_clip is not None:
         delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
@@ -629,6 +636,11 @@ def RangeROIGDC(
             "delta_final": delta_final,
             "target_node_indices": target_node_indices,
             "target_delta": target_delta,
+            "target_weights": (
+                np.ones(target_node_indices.shape, dtype=np.float64)
+                if target_weights is None
+                else np.asarray(target_weights, dtype=np.float64)
+            ),
             "guide_valid": guide_valid,
             "target_mask": target_mask,
             "force_mask": force_mask,
