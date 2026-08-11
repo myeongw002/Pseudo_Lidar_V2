@@ -73,23 +73,6 @@ POINTCLOUD_STAGES = [
     "range_gdc_pointcloud",
 ]
 
-ALIASES = {
-    # Legacy stage aliases from the discarded runner layout.
-    "image_gdc_sparse_depth": "canonical_shared_anchor_image_depth",
-    "shared_anchor_pointcloud": "canonical_shared_anchor",
-    "shared_anchor_image_depth": "canonical_shared_anchor_image_depth",
-    "image_gdc_depth": "original_gdc_naive",
-    "image_gdc_depth_to_range": "original_gdc_naive_depth_to_range",
-    "range_anchor": "range_anchor_from_shared_anchor",
-    "shared_anchor_range": "range_anchor_from_shared_anchor",
-    "range_anchor_from_gt_range": "range_anchor_from_shared_anchor",
-    "raw_sdn_range": "sdn_depth_to_range",
-    "image_gdc_range": "original_gdc_naive_depth_to_range",
-    "range_gdc_range": "range_gdc",
-    "preview_sdn_range": "preview_raw_sdn_range",
-}
-
-
 @dataclass
 class Stage:
     name: str
@@ -113,10 +96,6 @@ def split_values(values):
             if item:
                 result.append(item)
     return result
-
-
-def normalize_stage_name(name):
-    return ALIASES.get(name, name)
 
 
 def read_split_ids(split_file):
@@ -284,78 +263,6 @@ def validate_shared_anchor_provenance(provenance_path, sparse_dir, source_index_
         raise ValueError("Shared-anchor provenance validation failed: " + "; ".join(errors))
 
 
-def validate_fixed_row_anchor(
-    range_dir,
-    meta_dir,
-    definition_path,
-    gt_range_dir,
-    ids,
-    selected_rows,
-    expected_shape,
-):
-    selected_rows = np.unique(np.asarray(selected_rows, dtype=np.int32))
-    if selected_rows.size == 0:
-        raise ValueError("Range anchor selected_rows must not be empty")
-    if np.any(selected_rows < 0) or np.any(selected_rows >= int(expected_shape[0])):
-        raise ValueError(
-            f"Range anchor selected_rows {selected_rows.tolist()} are outside "
-            f"height {expected_shape[0]}"
-        )
-
-    if not file_nonempty(definition_path):
-        raise ValueError(f"Missing fixed-row anchor definition: {definition_path}")
-    with open(definition_path) as f:
-        definition = json.load(f)
-    expected_source = Path(gt_range_dir).resolve()
-    actual_source = Path(definition.get("source_gt_range_path", "")).resolve()
-    definition_shape = (
-        int(definition.get("expected_height", -1)),
-        int(definition.get("expected_width", -1)),
-    )
-    if definition.get("mode") != "gt_row_mask":
-        raise ValueError(
-            f"Range anchor mode must be 'gt_row_mask', got {definition.get('mode')!r}"
-        )
-    if [int(v) for v in definition.get("selected_rows", [])] != selected_rows.tolist():
-        raise ValueError("Range anchor definition selected_rows mismatch")
-    if definition_shape != tuple(expected_shape):
-        raise ValueError(
-            f"Range anchor definition shape {definition_shape} != {tuple(expected_shape)}"
-        )
-    if actual_source != expected_source:
-        raise ValueError(
-            f"Range anchor source mismatch: {actual_source} != {expected_source}"
-        )
-
-    hidden_rows = np.ones(int(expected_shape[0]), dtype=bool)
-    hidden_rows[selected_rows] = False
-    for scene_id in ids:
-        anchor = load_frame_npy(range_dir, scene_id).astype(np.float32)
-        gt = load_frame_npy(gt_range_dir, scene_id).astype(np.float32)
-        if anchor.shape != tuple(expected_shape):
-            raise ValueError(
-                f"{scene_id}: anchor shape {anchor.shape} != {tuple(expected_shape)}"
-            )
-        if gt.shape != tuple(expected_shape):
-            raise ValueError(f"{scene_id}: GT shape {gt.shape} != {tuple(expected_shape)}")
-        anchor_valid = np.isfinite(anchor) & (anchor > INVALID_VALUE)
-        gt_valid = np.isfinite(gt) & (gt > INVALID_VALUE)
-        if int(anchor_valid.sum()) == 0:
-            raise ValueError(f"{scene_id}: fixed-row anchor contains no valid cells")
-        if int(anchor_valid[hidden_rows, :].sum()) != 0:
-            raise ValueError(f"{scene_id}: fixed-row anchor contains hidden-row values")
-        if not np.array_equal(anchor_valid[selected_rows, :], gt_valid[selected_rows, :]):
-            raise ValueError(f"{scene_id}: fixed-row anchor valid mask differs from GT")
-        selected_valid = anchor_valid[selected_rows, :]
-        if np.any(selected_valid) and not np.array_equal(
-            anchor[selected_rows, :][selected_valid], gt[selected_rows, :][selected_valid]
-        ):
-            raise ValueError(f"{scene_id}: fixed-row anchor values differ from GT")
-        selected_rows_path = Path(meta_dir) / f"{scene_id}_selected_rows.npy"
-        if not selected_rows_path.exists() or not np.array_equal(np.load(selected_rows_path), selected_rows):
-            raise ValueError(f"{scene_id}: fixed-row metadata mismatch")
-
-
 def validate_shared_canonical_range_anchor(range_dir, meta_dir, definition_path, provenance_path, ids, selected_rows, expected_shape):
     if not file_nonempty(definition_path):
         raise ValueError(f"Missing shared canonical anchor definition: {definition_path}")
@@ -500,15 +407,15 @@ def build_context(args):
     threads = int(args.threads or cfg.get("threads", 4))
 
     anchor_cfg = dict(cfg.get("anchor", {}))
-    if anchor_cfg.get("mode", "shared_canonical") not in {"shared_canonical", "shared_pointcloud"}:
-        raise ValueError("anchor.mode must be shared_canonical (shared_pointcloud is a legacy alias)")
-    selected_lines = [int(v) for v in anchor_cfg.get("selected_rows", anchor_cfg.get("selected_lines", SELECTED_ROWS))]
-    if not selected_lines:
-        raise ValueError("anchor.selected_lines must not be empty")
+    if anchor_cfg.get("mode", "shared_canonical") != "shared_canonical":
+        raise ValueError("anchor.mode must be shared_canonical")
+    anchor_rows = [int(v) for v in anchor_cfg.get("selected_rows", SELECTED_ROWS)]
+    if not anchor_rows:
+        raise ValueError("anchor.selected_rows must not be empty")
 
     range_anchor_cfg = dict(cfg.get("range_anchor", {}))
-    if range_anchor_cfg.get("mode", "shared_canonical") not in {"shared_canonical", "gt_rows"}:
-        raise ValueError("range_anchor.mode must be shared_canonical (gt_rows is a legacy alias)")
+    if range_anchor_cfg.get("mode", "shared_canonical") != "shared_canonical":
+        raise ValueError("range_anchor.mode must be shared_canonical")
     selected_rows = [
         int(v)
         for v in range_anchor_cfg.get("selected_rows", SELECTED_ROWS)
@@ -517,7 +424,7 @@ def build_context(args):
         raise ValueError("range_anchor.selected_rows must not be empty")
     if len(set(selected_rows)) != len(selected_rows):
         raise ValueError("range_anchor.selected_rows must not contain duplicates")
-    if selected_rows != selected_lines:
+    if selected_rows != anchor_rows:
         raise ValueError("anchor.selected_rows and range_anchor.selected_rows must define the same canonical source rows")
 
     range_cfg = dict(cfg.get("range_gdc", {}))
@@ -624,7 +531,7 @@ def build_context(args):
         "data_tag": data_tag,
         "threads": threads,
         "projection": projection,
-        "anchor": {**anchor_cfg, "selected_rows": selected_lines},
+        "anchor": {**anchor_cfg, "selected_rows": anchor_rows},
         "range_anchor": {**range_anchor_cfg, "selected_rows": selected_rows},
         "anchor_filter": anchor_filter,
         "original_gdc": original_cfg,
@@ -644,7 +551,6 @@ def build_context(args):
         "threads": threads,
         "data_tag": data_tag,
         "projection": projection,
-        "selected_lines": selected_lines,
         "selected_rows": selected_rows,
         "anchor_cfg": anchor_cfg,
         "range_anchor_cfg": range_anchor_cfg,
@@ -796,11 +702,10 @@ def build_stages(ctx):
         ]]
 
 
-    def range_anchor_from_gt_commands():
+    def range_anchor_commands():
         return [[
             sys.executable,
-            str(REPO_ROOT / "range_gdc" / "make_anchor_from_gt_range.py"),
-            "--mode", "shared_canonical",
+            str(REPO_ROOT / "range_gdc" / "build_range_anchor.py"),
             "--output_range_path", str(p["anchor_range"]),
             "--output_mask_path", str(p["anchor_mask"]),
             "--split_file", str(p["split_file"]),
@@ -879,12 +784,7 @@ def build_stages(ctx):
         for name in (
             "method", "range_min", "range_max", "lambda_anchor", "lambda_prior",
             "lambda_smooth", "neighbor", "edge_spatial_mode", "sigma_angular",
-            "sigma_tangent", "sigma_log_range", "max_log_range_diff", "transfer_k",
-            "transfer_neighbor_mode", "direct_weight_mode", "confidence_mode",
-            "sigma_conf_pixel", "sigma_conf_angular", "sigma_conf_log_range",
-            "confidence_power", "confidence_min", "confidence_max", "selection_mode",
-            "confidence_high_thr", "confidence_low_thr", "direct_log_range_thr",
-            "graph_log_range_thr", "delta_clip",
+            "sigma_tangent", "sigma_log_range", "max_log_range_diff", "delta_clip",
         ):
             if name in rgdc:
                 add_arg(cmd, "--" + name, rgdc[name])
@@ -893,7 +793,7 @@ def build_stages(ctx):
     method_paths = []
     if evaluation.get("include_raw", True):
         method_paths.append(("sdn_raw", p["raw_sdn_range"]))
-    include_original = evaluation.get("include_original_gdc", evaluation.get("include_image_gdc", True))
+    include_original = evaluation.get("include_original_gdc", True)
     if include_original and original.get("run_naive", True):
         method_paths.append(("original_gdc_naive", p["original_gdc_naive_range"]))
     if include_original and original.get("run_optimized", True):
@@ -971,7 +871,7 @@ def build_stages(ctx):
             [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"], p["projection_meta"]],
             [p["anchor_range"], p["anchor_mask"], p["anchor_meta"], p["anchor_definition"]],
             [p["anchor_range_root"]],
-            range_anchor_from_gt_commands,
+            range_anchor_commands,
             lambda ids: validate_shared_canonical_range_anchor(
                 p["anchor_range"],
                 p["anchor_meta"],
@@ -1084,16 +984,16 @@ def ordered_stage_names(args, ctx):
 def select_stages(args, order):
     selected = order[:]
     if args.only_stage:
-        selected = [normalize_stage_name(args.only_stage)]
+        selected = [args.only_stage]
     if args.stages:
-        selected = [normalize_stage_name(name) for name in split_values([args.stages])]
+        selected = split_values([args.stages])
     if args.from_stage:
-        start = order.index(normalize_stage_name(args.from_stage))
+        start = order.index(args.from_stage)
         selected = [name for name in selected if order.index(name) >= start]
     if args.to_stage:
-        end = order.index(normalize_stage_name(args.to_stage))
+        end = order.index(args.to_stage)
         selected = [name for name in selected if order.index(name) <= end]
-    skip = {normalize_stage_name(name) for name in split_values(args.skip_stage)}
+    skip = set(split_values(args.skip_stage))
     return [name for name in selected if name not in skip]
 
 
@@ -1206,7 +1106,7 @@ def write_run_artifacts(ctx, selected, results, dry_run):
         "run_root": str(p["output_root"]),
         "split_file": str(p["split_file"]),
         "frame_count": len(ctx["ids"]),
-        "selected_lines": ctx["selected_lines"],
+        "selected_rows": ctx["selected_rows"],
         "range_h": ctx["projection"]["height"],
         "range_w": ctx["projection"]["width"],
         "projection": ctx["projection"],
@@ -1294,7 +1194,7 @@ def main():
             raise ValueError(f"Unknown stage: {name}")
 
     if args.clean_stage:
-        name = normalize_stage_name(args.clean_stage)
+        name = args.clean_stage
         if name not in stages:
             raise ValueError(f"Unknown stage: {name}")
         print(f"Cleaning stage: {name}")
@@ -1304,11 +1204,11 @@ def main():
                 safe_delete(path, ctx["paths"]["output_root"])
         return
 
-    force_set = {normalize_stage_name(name) for name in split_values(args.force_stage)}
+    force_set = set(split_values(args.force_stage))
     if args.force:
         force_set.update(selected)
     if args.force_from:
-        start = order.index(normalize_stage_name(args.force_from))
+        start = order.index(args.force_from)
         force_set.update(name for name in order[start:] if name in selected)
 
     print("Clean Range-GDC experiment")

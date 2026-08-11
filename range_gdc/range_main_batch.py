@@ -1,4 +1,4 @@
-"""Batch runner for confidence-aware residual transfer Range GDC."""
+"""Batch runner for graph-only Range-GDC."""
 
 import argparse
 import csv
@@ -28,6 +28,13 @@ STATS_FIELDNAMES = [
     "N_anchor_overlap",
     "N_residual_targets",
     "N_rejected_residual_targets",
+    "anchor_candidate_count",
+    "anchor_overlap_count",
+    "anchor_before_reject_count",
+    "anchor_after_reject_count",
+    "anchor_reject_count",
+    "anchor_reject_ratio",
+    "anchor_reject_mode",
     "anchor_force_policy",
     "anchor_forced_count",
     "output_valid_count",
@@ -37,32 +44,9 @@ STATS_FIELDNAMES = [
     "delta_graph_std",
     "delta_graph_abs_mean",
     "propagation_ratio_graph",
-    "transfer_k",
-    "transfer_neighbor_mode",
-    "direct_weight_mode",
-    "confidence_mode",
-    "delta_direct_mean",
-    "delta_direct_std",
-    "delta_direct_abs_mean",
-    "nearest_anchor_pixel_dist_mean",
-    "nearest_anchor_pixel_dist_median",
-    "nearest_anchor_log_range_diff_mean",
-    "nearest_anchor_log_range_diff_median",
-    "confidence_mean",
-    "confidence_std",
-    "confidence_min_value",
-    "confidence_max_value",
-    "confidence_median",
-    "confidence_p10",
-    "confidence_p90",
-    "confidence_high_ratio",
-    "confidence_mid_ratio",
-    "confidence_low_ratio",
     "delta_final_mean",
     "delta_final_std",
     "delta_final_abs_mean",
-    "delta_final_vs_graph_abs_mean",
-    "delta_final_vs_direct_abs_mean",
     "neighbor",
     "edge_spatial_mode",
     "sigma_angular",
@@ -83,26 +67,6 @@ STATS_FIELDNAMES = [
     "lambda_anchor",
     "lambda_prior",
     "lambda_smooth",
-    "sigma_conf_pixel",
-    "sigma_conf_angular",
-    "sigma_conf_log_range",
-    "confidence_power",
-    "confidence_min",
-    "confidence_max",
-    "selection_mode",
-    "confidence_high_thr",
-    "confidence_low_thr",
-    "direct_log_range_thr",
-    "graph_log_range_thr",
-    "selection_direct_count",
-    "selection_graph_count",
-    "selection_blend_count",
-    "selection_direct_ratio",
-    "selection_graph_ratio",
-    "selection_blend_ratio",
-    "selection_invalid_direct_count",
-    "selection_invalid_conf_count",
-    "selection_invalid_dlog_count",
     "delta_clip",
     "residual_target_mean",
     "residual_target_std",
@@ -111,8 +75,8 @@ STATS_FIELDNAMES = [
     "anchor_rmse_before",
     "anchor_abs_error_after_graph_solve",
     "anchor_rmse_after_graph_solve",
-    "anchor_abs_error_after_blend",
-    "anchor_rmse_after_blend",
+    "anchor_abs_error_after_graph",
+    "anchor_rmse_after_graph",
     "anchor_abs_error_after_force",
     "anchor_rmse_after_force",
     "accepted_anchor_mae_after_correction",
@@ -126,9 +90,6 @@ STATS_FIELDNAMES = [
     "t_build_nodes",
     "t_build_graph",
     "t_graph_solve",
-    "t_find_nearest_anchor",
-    "t_build_direct_transfer",
-    "t_blend",
     "t_total_correction",
 ]
 
@@ -347,25 +308,8 @@ def process_one(task):
         sigma_tangent=args_dict["sigma_tangent"],
         sigma_log_range=args_dict["sigma_log_range"],
         max_log_range_diff=args_dict["max_log_range_diff"],
-        transfer_k=args_dict["transfer_k"],
-        transfer_neighbor_mode=args_dict["transfer_neighbor_mode"],
-        direct_weight_mode=args_dict["direct_weight_mode"],
-        confidence_mode=args_dict["confidence_mode"],
-        sigma_conf_pixel=args_dict["sigma_conf_pixel"],
-        sigma_conf_angular=args_dict["sigma_conf_angular"],
-        sigma_conf_log_range=args_dict["sigma_conf_log_range"],
-        confidence_power=args_dict["confidence_power"],
-        confidence_min=args_dict["confidence_min"],
-        confidence_max=args_dict["confidence_max"],
-        selection_mode=args_dict["selection_mode"],
-        confidence_high_thr=args_dict["confidence_high_thr"],
-        confidence_low_thr=args_dict["confidence_low_thr"],
-        direct_log_range_thr=args_dict["direct_log_range_thr"],
-        graph_log_range_thr=args_dict["graph_log_range_thr"],
         delta_clip=args_dict["delta_clip"],
-        force_anchor_value=args_dict["force_anchor_value"],
         anchor_force_policy=args_dict["anchor_force_policy"],
-        ablation_mode=args_dict["ablation_mode"],
         return_stats=True,
         verbose=args_dict["verbose"],
     )
@@ -393,7 +337,7 @@ def write_stats_csv(path, stats_rows):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run confidence-aware residual transfer Range GDC.")
+    parser = argparse.ArgumentParser(description="Run graph-only Range-GDC.")
     parser.add_argument("--pred_path", "--guide_path", dest="pred_path", required=True)
     parser.add_argument("--anchor_path", required=True)
     parser.add_argument(
@@ -422,43 +366,16 @@ def parse_args():
     parser.add_argument("--sigma_tangent", type=float, default=1.0)
     parser.add_argument("--sigma_log_range", type=float, default=0.3)
     parser.add_argument("--max_log_range_diff", type=float, default=None)
-    parser.add_argument("--transfer_k", type=int, default=1)
-    parser.add_argument("--transfer_neighbor_mode", choices=["rowcol", "angular"], default="rowcol")
-    parser.add_argument("--direct_weight_mode", choices=["nearest", "weighted_knn"], default="nearest")
-    parser.add_argument("--confidence_mode", choices=["nearest", "max_weight", "sum_weight"], default="nearest")
-    parser.add_argument("--sigma_conf_pixel", type=float, default=2.0)
-    parser.add_argument("--sigma_conf_angular", type=float, default=0.01)
-    parser.add_argument("--sigma_conf_log_range", type=float, default=0.05)
-    parser.add_argument("--confidence_power", type=float, default=2.0)
-    parser.add_argument("--confidence_min", type=float, default=0.0)
-    parser.add_argument("--confidence_max", type=float, default=1.0)
-    parser.add_argument(
-        "--selection_mode",
-        choices=["soft", "confidence_hard", "log_range_piecewise"],
-        default="confidence_hard",
-        help="Residual selection mode after graph/direct proposals.",
-    )
-    parser.add_argument("--confidence_high_thr", type=float, default=0.8)
-    parser.add_argument("--confidence_low_thr", type=float, default=0.2)
-    parser.add_argument("--direct_log_range_thr", type=float, default=0.05)
-    parser.add_argument("--graph_log_range_thr", type=float, default=0.2)
     parser.add_argument("--delta_clip", type=float, default=0.3)
     parser.add_argument(
         "--anchor_force_policy",
         choices=["accepted_only", "all_valid", "none"],
         default="accepted_only",
     )
-    parser.add_argument(
-        "--force_anchor_value",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="deprecated alias: true=accepted_only, false=none",
-    )
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--max_items", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--ablation_mode", choices=["full", "graph_only", "direct_only"], default="full")
     return parser.parse_args()
 
 
@@ -481,22 +398,6 @@ def validate_args(args):
         raise ValueError("sigma values must be positive")
     if args.max_log_range_diff is not None and args.max_log_range_diff <= 0:
         raise ValueError("--max_log_range_diff must be positive when set")
-    if args.transfer_k <= 0:
-        raise ValueError("--transfer_k must be positive")
-    if (
-        args.sigma_conf_pixel <= 0
-        or args.sigma_conf_angular <= 0
-        or args.sigma_conf_log_range <= 0
-    ):
-        raise ValueError("confidence sigma values must be positive")
-    if args.confidence_power <= 0:
-        raise ValueError("--confidence_power must be positive")
-    if not (0.0 <= args.confidence_min <= args.confidence_max <= 1.0):
-        raise ValueError("--confidence_min/max must satisfy 0 <= min <= max <= 1")
-    if not (0.0 <= args.confidence_low_thr <= args.confidence_high_thr <= 1.0):
-        raise ValueError("--confidence_low_thr/high_thr must satisfy 0 <= low <= high <= 1")
-    if args.direct_log_range_thr >= args.graph_log_range_thr:
-        raise ValueError("--direct_log_range_thr must be < --graph_log_range_thr")
     if args.delta_clip is not None and args.delta_clip <= 0:
         raise ValueError("--delta_clip must be positive when set")
 
@@ -536,7 +437,7 @@ def main():
         for scene_id in scene_ids
     ]
 
-    print("Confidence-aware residual transfer Range GDC batch settings")
+    print("Graph-only Range-GDC batch settings")
     print(f"frames            : {len(tasks)}")
     print(f"pred_path         : {args.pred_path}")
     print(f"anchor_path       : {args.anchor_path}")
@@ -545,9 +446,6 @@ def main():
     print(f"method            : {args.method}")
     print(f"neighbor          : {args.neighbor}")
     print(f"edge_spatial_mode : {args.edge_spatial_mode}")
-    print(f"transfer_k        : {args.transfer_k}")
-    print(f"confidence_mode   : {args.confidence_mode}")
-    print(f"selection_mode    : {args.selection_mode}")
     print(f"threads           : {args.threads}")
 
     stats_rows = []

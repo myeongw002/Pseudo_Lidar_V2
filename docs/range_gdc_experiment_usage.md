@@ -1,21 +1,36 @@
-# Range-GDC Paper Experiment Runner
+# Canonical Range-GDC Experiment
 
 The canonical entry point is:
 
 ```bash
-python3 -B tools/run_range_gdc_experiment.py --config configs/r64_pipeline_canonical.yaml
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline_canonical.yaml
 ```
 
-`run_r64_pipeline.py` is obsolete and is not used by this workflow.
-`tests/test_paper_pipeline.py` likewise targets this canonical runner and does
-not import the obsolete module.
+## Method
 
-`tools/run_ablation.sh` remains a convenience utility rather than the canonical
-runner. It now resolves the repository path dynamically and refuses to reuse
-an existing ablation output directory; set `ROOT` and `ABLATION_ROOT` to fresh
-locations when using it.
+```text
+shared sparse physical LiDAR points
+    -> canonical RGC anchor
+    -> binary anchor filtering
+    -> log-range residual observations
+    -> graph-regularized propagation
+    -> corrected range
+```
 
-## Core pipeline
+Canonical projection first records each spherical cell's nearest collision
+winner as an original point-cloud source index. Rows `[5, 7, 9, 11]` select
+the exact original x/y/z/intensity records used by both correction baselines.
+Original GDC projects those shared records to camera depth. Range-GDC derives
+its range anchor from the same source-index grid and uses `norm(x,y,z)`.
+
+Range-GDC constructs an `angular_grid8` graph over valid SDN range cells and
+solves for a graph-regularized log-range residual. Binary anchor rejection,
+residual clipping, and `accepted_only` anchor forcing follow the checked-in
+canonical configuration. It corrects existing predicted cells only and does
+not complete missing cells.
+
+## Canonical stages
 
 ```text
 sdn_depth
@@ -33,22 +48,9 @@ range_gdc
 evaluate
 ```
 
-The two correction methods use the same canonical original-LiDAR points:
+Stage names are exact; the runner does not translate historical names.
 
-- Canonical projection records the nearest collision winner's original PCD index
-  for rows `[5, 7, 9, 11]`, then writes the exact original x/y/z/intensity
-  records to `anchor/shared_canonical_pointcloud/` and the full source-index
-  grid to `anchor/shared_canonical_source_index/`.
-- Original GDC projects only that point cloud to camera z-depth with nearest
-  positive camera-z collision handling.
-- Range GDC creates its anchor only from that same source-index grid and point
-  cloud; it does not copy rows from GT range.
-
-With the default config, Range GDC uses rows `[5, 7, 9, 11]`. Evaluation excludes
-exactly these four rows and evaluates the remaining 60 rows. It does not infer
-excluded rows from frame-wise projected anchor occupancy.
-
-## Dry run and execution
+## Dry runs
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
@@ -56,10 +58,12 @@ python3 -B tools/run_range_gdc_experiment.py \
   --dry-run
 
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml
+  --config configs/r64_pipeline_canonical_val.yaml \
+  --dry-run
 ```
 
-Use a fresh `output_root` after applying this patch.
+Use a fresh `output_root` for an actual run. Resume validation checks each
+stage's expected artifacts before deciding whether to skip it.
 
 ## Stage selection
 
@@ -67,29 +71,18 @@ Use a fresh `output_root` after applying this patch.
 # Evaluation only
 python3 -B tools/run_range_gdc_experiment.py \
   --config configs/r64_pipeline_canonical.yaml \
-  --only-stage evaluate \
-  --force-stage evaluate
+  --only-stage evaluate --force-stage evaluate
 
-# Rebuild the shared canonical RGC anchor and every downstream stage
+# Rebuild the canonical range anchor and downstream stages
 python3 -B tools/run_range_gdc_experiment.py \
   --config configs/r64_pipeline_canonical.yaml \
   --force-from range_anchor_from_shared_anchor
 
-# Rebuild the Original-GDC physical anchor and all later stages
+# Rerun correction and evaluation
 python3 -B tools/run_range_gdc_experiment.py \
   --config configs/r64_pipeline_canonical.yaml \
-  --force-from canonical_shared_anchor
-
-# Rerun only Range GDC and evaluation after the anchor is already correct
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
-  --stages range_gdc,evaluate \
-  --force
+  --stages range_gdc,evaluate --force
 ```
-
-`shared_anchor_range` remains accepted as a compatibility alias for
-`range_anchor_from_shared_anchor`, but new commands should use the canonical
-stage name.
 
 ## Main outputs
 
@@ -109,74 +102,38 @@ original_gdc/optimized/corrected_depth/
 range/original_gdc_naive/G64_range/
 range/original_gdc_optimized/G64_range/
 range/range_gdc/G64_range/
+range/range_gdc/meta/range_gdc_stats.csv
 metrics/guide_r64_summary.csv
 metrics/guide_r64_distance_summary.csv
 metrics/range_gdc_leakage_summary.csv
 ```
 
-## Fixed-row validation
+## Protocol audits
 
-The `range_anchor_from_shared_anchor` stage is complete only when all of the following
-hold for every frame:
+The `range_anchor_from_shared_anchor` stage requires a `64 x 1024` anchor,
+values only on configured rows, a valid shared source index for every anchor
+cell, and a matching shared-manifest checksum.
 
-- the anchor has shape `64 x 1024`;
-- valid anchor cells exist only on the configured fixed rows;
-- every valid anchor cell has a valid shared source index;
-- `anchor_definition.json` references the checksum of the shared manifest;
-- each frame records the same configured row list;
-- `anchor_definition.json` reports `mode: shared_canonical` and the expected source,
-  shape, and row indices.
-
-Run `python3 -B tools/audit_shared_anchor_protocol.py --output-root <root>
---split-file <split> --calib-dir <kitti>/calib --image-dir <kitti>/image_2`
-after the anchor stages. It re-hashes every shared PCD, checks source-index and
-point counts, and requires exact RGC/GDC validity plus values within `1e-5`.
-
-For a one-frame protocol-only smoke test, use a fresh root:
+Run the full shared-source audit with:
 
 ```bash
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
-  --split-file split/test_1.txt \
-  --output-root /data/kitti/pseudo_lidar_shared_canonical_smoke \
-  --stages canonical_shared_anchor,canonical_shared_anchor_image_depth,gt_range,range_anchor_from_shared_anchor,audit_shared_anchor_protocol \
-  --no-preview \
-  --no-export-pointcloud
+python3 -B tools/audit_shared_anchor_protocol.py \
+  --output-root <root> \
+  --split-file <split> \
+  --calib-dir <kitti>/calib \
+  --image-dir <kitti>/image_2
 ```
 
-`gt_range` is included because the current RGC-anchor stage copies the canonical
-projection metadata from that stage; the audit itself does not consume GT values.
-
-## Anchor-rejection consistency audit
-
-After canonical image source-index maps exist, compare native GDC camera-z and
-RGC spherical-range rejection on common original LiDAR source IDs only:
+To compare native Original-GDC camera-depth and Range-GDC spherical-range
+rejection decisions on common source IDs:
 
 ```bash
 python3 -B tools/audit_anchor_rejection_consistency.py \
-  --output-root /data/kitti/pseudo_lidar_shared_canonical_100 \
-  --split-file split/test_100.txt \
-  --kitti-root /data/kitti/kitti_object/testing \
+  --output-root <root> \
+  --split-file <split> \
+  --kitti-root <kitti-root> \
   --config configs/r64_pipeline_canonical.yaml
 ```
 
-This writes per-point, per-frame, global-summary, and distance-bin CSV files
-under `<output_root>/metrics/`. It measures native-rule disagreement and does
-not modify either rejection rule. The default `--gdc-variant naive` uses the
-non-subsampled production candidate mask; pass `--gdc-variant optimized` to
-include the configured optimized-GDC subsampling mask.
-
-## Distance-bin evaluation
-
-Distance evaluation is enabled unless `--no-distance-eval` is supplied. To
-recompute and print the distance-bin summary without rerunning correction:
-
-```bash
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
-  --only-stage evaluate \
-  --force-stage evaluate
-```
-
-The summary is written to
-`<output_root>/metrics/guide_r64_distance_summary.csv`.
+Evaluation excludes exactly the configured source rows and retains the
+canonical hidden-row and common-mask definitions.

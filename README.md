@@ -1,4 +1,57 @@
-# Pseudo-LiDAR++: Accurate Depth for 3D Object Detection in Autonomous Driving
+# Sparse LiDAR-Guided Range-Grid Correction
+
+This repository extends Pseudo-LiDAR++ with a reproducible sparse-LiDAR-guided
+range-grid correction pipeline. Stereo depth is produced by SDN, Original GDC
+is retained as the image-depth baseline, and Range-Grid Correction (Range-GDC)
+is the canonical range-domain method.
+
+The two correction methods consume the same sparse physical LiDAR points. A
+canonical spherical projection preserves each selected point's original source
+identity and collision winner. Range-GDC operates on a `64 x 1024` range grid,
+uses log-range residuals on an `angular_grid8` graph, and corrects only cells
+that already contain a valid SDN prediction; it does not perform completion.
+
+The production flow is:
+
+```text
+SDN stereo depth
+  -> canonical shared sparse LiDAR points
+  -> binary anchor rejection
+  -> graph-regularized log-range residual solve
+  -> residual clipping and accepted-anchor forcing
+  -> corrected range
+```
+
+Reproduce or inspect the pipeline with:
+
+```bash
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline_canonical.yaml \
+  --dry-run
+
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline_canonical.yaml
+```
+
+Canonical configs:
+
+- `configs/r64_pipeline_canonical.yaml`
+- `configs/r64_pipeline_canonical_val.yaml`
+- `configs/r64_pipeline_canonical_train1000.yaml`
+
+Major outputs live below the configured `output_root`, notably
+`anchor/shared_canonical_pointcloud/`,
+`anchor/range_shared_canonical/G64_range/`,
+`original_gdc/{naive,optimized}/`, `range/range_gdc/G64_range/`, and
+`metrics/`. See
+[the canonical experiment guide](docs/range_gdc_experiment_usage.md) for stage,
+audit, and output details.
+
+## Upstream Pseudo-LiDAR++
+
+The original Pseudo-LiDAR++ project and attribution are retained below.
+
+### Pseudo-LiDAR++: Accurate Depth for 3D Object Detection in Autonomous Driving
 This paper has been accpeted by International Conference on Learning Representations ([ICLR](https://iclr.cc/)) 2020.
 
 [Pseudo-LiDAR++: Accurate Depth for 3D Object Detection in Autonomous Driving](https://openreview.net/forum?id=BJedHRVtPB)
@@ -7,9 +60,6 @@ by [Yurong You*](http://yurongyou.com/), [Yan Wang*](https://www.cs.cornell.edu/
 
 ![Figure](figures/whole_model.png)
 
-For the reproducible shared-anchor comparison of Original GDC naive, Original
-GDC optimized, and Range GDC, see
-[docs/paper_gdc_experiment.md](docs/paper_gdc_experiment.md).
 ### Citation
 ```
 @inproceedings{you2020pseudo,

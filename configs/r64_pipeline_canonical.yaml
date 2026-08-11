@@ -16,10 +16,23 @@ range_anchor:
   mode: shared_canonical
   selected_rows: [5, 7, 9, 11]
   threads: 4
+anchor_filter:
+  mode: abs
+  abs_error_thr: 2.0
+  log_ratio_thr: 0.4
+  force_policy: accepted_only
 range_gdc:
+  method: cg
   range_min: 0.1
   range_max: 80.0
-  selection_mode: soft
+  lambda_anchor: 300.0
+  lambda_prior: 0.1
+  lambda_smooth: 1.0
+  neighbor: angular_grid8
+  edge_spatial_mode: angular
+  sigma_angular: 0.01
+  sigma_log_range: 0.3
+  delta_clip: 0.3
   projection:
     height: 64
     width: 1024
@@ -33,7 +46,7 @@ original_gdc:
   run_optimized: true
 evaluation:
   include_raw: true
-  include_image_gdc: true
+  include_original_gdc: true
   include_range_gdc: true
   enable_leakage_check: true
   source_rows: 4

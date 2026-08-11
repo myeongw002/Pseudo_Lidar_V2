@@ -3,17 +3,11 @@ import time
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import cg, spsolve
-from scipy.spatial import cKDTree
 
 
 ANCHOR_REJECT_MODES = {"log_ratio", "abs", "none"}
 NEIGHBOR_MODES = {"angular_grid4", "angular_grid8"}
 EDGE_SPATIAL_MODES = {"angular", "tangent"}
-TRANSFER_NEIGHBOR_MODES = {"rowcol", "angular"}
-DIRECT_WEIGHT_MODES = {"nearest", "weighted_knn"}
-CONFIDENCE_MODES = {"nearest", "max_weight", "sum_weight"}
-SELECTION_MODES = {"soft", "confidence_hard", "log_range_piecewise"}
-ABLATION_MODES = {"full", "graph_only", "direct_only"}
 
 
 def valid_range_mask(range_img, range_min=0.1, range_max=80.0):
@@ -132,14 +126,6 @@ def _vector_stats(values, prefix):
         f"{prefix}_std": float(np.std(values)),
         f"{prefix}_abs_mean": float(np.mean(np.abs(values))),
     }
-
-
-def _quantile(values, q):
-    values = np.asarray(values, dtype=np.float64)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return np.nan
-    return float(np.quantile(values, q))
 
 
 def build_spherical_graph_laplacian(
@@ -330,236 +316,6 @@ def _solve_linear_system(A, b, method):
     return x, info
 
 
-def _angle_features(rows, cols, shape, *, vertical_centers_deg=None, azimuth_centers_deg=None, azimuth_mode="full_360_front_centered"):
-    elevation, azimuth = _angle_centers_for_shape(
-        shape,
-        vertical_centers_deg=vertical_centers_deg,
-        azimuth_centers_deg=azimuth_centers_deg,
-        azimuth_mode=azimuth_mode,
-    )
-    elev = elevation[rows]
-    az = azimuth[cols]
-    return np.stack([np.cos(az), np.sin(az), elev], axis=1)
-
-
-def _rowcol_augmented_features(rows, cols, width):
-    base = np.stack([rows, cols], axis=1).astype(np.float64)
-    left = np.stack([rows, cols - width], axis=1).astype(np.float64)
-    right = np.stack([rows, cols + width], axis=1).astype(np.float64)
-    features = np.concatenate([base, left, right], axis=0)
-    source = np.concatenate(
-        [
-            np.arange(len(rows), dtype=np.int64),
-            np.arange(len(rows), dtype=np.int64),
-            np.arange(len(rows), dtype=np.int64),
-        ]
-    )
-    return features, source
-
-
-def _query_transfer_neighbors(
-    node_rows,
-    node_cols,
-    target_rows,
-    target_cols,
-    shape,
-    *,
-    transfer_k,
-    transfer_neighbor_mode,
-    vertical_centers_deg=None,
-    azimuth_centers_deg=None,
-    azimuth_mode="full_360_front_centered",
-):
-    N = int(len(node_rows))
-    M = int(len(target_rows))
-    if M == 0:
-        return np.full((N, 0), -1, dtype=np.int64), np.full((N, 0), np.nan, dtype=np.float64)
-
-    k = min(max(int(transfer_k), 1), M)
-    if transfer_neighbor_mode == "rowcol":
-        target_features, source = _rowcol_augmented_features(target_rows, target_cols, shape[1])
-        node_features = np.stack([node_rows, node_cols], axis=1).astype(np.float64)
-        query_k = min(target_features.shape[0], max(k * 3, 1))
-        tree = cKDTree(target_features)
-        dist, idx = tree.query(node_features, k=query_k)
-        if query_k == 1:
-            dist = dist[:, None]
-            idx = idx[:, None]
-        neigh_idx = np.full((N, k), -1, dtype=np.int64)
-        neigh_dist = np.full((N, k), np.nan, dtype=np.float64)
-        for i in range(N):
-            used = set()
-            out = 0
-            for d, raw_idx in zip(dist[i], idx[i]):
-                src = int(source[int(raw_idx)])
-                if src in used:
-                    continue
-                used.add(src)
-                neigh_idx[i, out] = src
-                neigh_dist[i, out] = float(d)
-                out += 1
-                if out >= k:
-                    break
-        return neigh_idx, neigh_dist
-
-    if transfer_neighbor_mode == "angular":
-        target_features = _angle_features(
-            target_rows,
-            target_cols,
-            shape,
-            vertical_centers_deg=vertical_centers_deg,
-            azimuth_centers_deg=azimuth_centers_deg,
-            azimuth_mode=azimuth_mode,
-        )
-        node_features = _angle_features(
-            node_rows,
-            node_cols,
-            shape,
-            vertical_centers_deg=vertical_centers_deg,
-            azimuth_centers_deg=azimuth_centers_deg,
-            azimuth_mode=azimuth_mode,
-        )
-        tree = cKDTree(target_features)
-        dist, idx = tree.query(node_features, k=k)
-        if k == 1:
-            dist = dist[:, None]
-            idx = idx[:, None]
-        return idx.astype(np.int64), dist.astype(np.float64)
-
-    raise ValueError(
-        f"transfer_neighbor_mode must be one of {sorted(TRANSFER_NEIGHBOR_MODES)}, got {transfer_neighbor_mode!r}"
-    )
-
-
-def build_direct_residual_transfer(
-    raw_log_nodes,
-    node_rows,
-    node_cols,
-    target_node_indices,
-    target_delta,
-    *,
-    shape,
-    transfer_k=1,
-    transfer_neighbor_mode="rowcol",
-    direct_weight_mode="nearest",
-    confidence_mode="nearest",
-    sigma_conf_pixel=2.0,
-    sigma_conf_angular=0.01,
-    sigma_conf_log_range=0.1,
-    confidence_power=1.0,
-    confidence_min=0.0,
-    confidence_max=1.0,
-    vertical_centers_deg=None,
-    azimuth_centers_deg=None,
-    azimuth_mode="full_360_front_centered",
-):
-    if transfer_neighbor_mode not in TRANSFER_NEIGHBOR_MODES:
-        raise ValueError(f"transfer_neighbor_mode must be one of {sorted(TRANSFER_NEIGHBOR_MODES)}")
-    if direct_weight_mode not in DIRECT_WEIGHT_MODES:
-        raise ValueError(f"direct_weight_mode must be one of {sorted(DIRECT_WEIGHT_MODES)}")
-    if confidence_mode not in CONFIDENCE_MODES:
-        raise ValueError(f"confidence_mode must be one of {sorted(CONFIDENCE_MODES)}")
-    if transfer_k <= 0:
-        raise ValueError("transfer_k must be positive")
-    if sigma_conf_pixel <= 0 or sigma_conf_angular <= 0 or sigma_conf_log_range <= 0:
-        raise ValueError("confidence sigma values must be positive")
-    if confidence_power <= 0:
-        raise ValueError("confidence_power must be positive")
-    if confidence_min < 0 or confidence_max > 1 or confidence_min > confidence_max:
-        raise ValueError("confidence_min/max must satisfy 0 <= min <= max <= 1")
-
-    N = int(len(raw_log_nodes))
-    target_node_indices = np.asarray(target_node_indices, dtype=np.int64)
-    target_delta = np.asarray(target_delta, dtype=np.float64)
-    delta_direct = np.zeros((N,), dtype=np.float64)
-    confidence = np.zeros((N,), dtype=np.float64)
-    nearest_pixel_dist = np.full((N,), np.nan, dtype=np.float64)
-    nearest_log_diff = np.full((N,), np.nan, dtype=np.float64)
-
-    if target_node_indices.size == 0:
-        return delta_direct, confidence, nearest_pixel_dist, nearest_log_diff, {
-            "nearest_anchor_pixel_dist_mean": np.nan,
-            "nearest_anchor_pixel_dist_median": np.nan,
-            "nearest_anchor_log_range_diff_mean": np.nan,
-            "nearest_anchor_log_range_diff_median": np.nan,
-            "t_find_nearest_anchor": 0.0,
-            "t_build_direct_transfer": 0.0,
-        }, {}
-
-    target_rows = node_rows[target_node_indices]
-    target_cols = node_cols[target_node_indices]
-    t_query0 = time.perf_counter()
-    neigh_idx, neigh_dist = _query_transfer_neighbors(
-        node_rows,
-        node_cols,
-        target_rows,
-        target_cols,
-        shape,
-        transfer_k=transfer_k,
-        transfer_neighbor_mode=transfer_neighbor_mode,
-        vertical_centers_deg=vertical_centers_deg,
-        azimuth_centers_deg=azimuth_centers_deg,
-        azimuth_mode=azimuth_mode,
-    )
-    t_query = time.perf_counter() - t_query0
-
-    t_weight0 = time.perf_counter()
-    spatial_sigma = sigma_conf_pixel if transfer_neighbor_mode == "rowcol" else sigma_conf_angular
-    weight_max = np.zeros((N,), dtype=np.float64)
-    weight_sum = np.zeros((N,), dtype=np.float64)
-    for i in range(N):
-        valid = neigh_idx[i] >= 0
-        if not np.any(valid):
-            continue
-        idx = neigh_idx[i, valid]
-        dist = neigh_dist[i, valid]
-        log_diff = np.abs(raw_log_nodes[i] - raw_log_nodes[target_node_indices[idx]])
-        weights = np.exp(-(dist ** 2) / (2.0 * spatial_sigma ** 2)) * np.exp(
-            -(log_diff ** 2) / (2.0 * sigma_conf_log_range ** 2)
-        )
-        weights = np.where(np.isfinite(weights), weights, 0.0)
-        nearest_pixel_dist[i] = float(dist[0])
-        nearest_log_diff[i] = float(log_diff[0])
-        if direct_weight_mode == "weighted_knn" and float(np.sum(weights)) > 0.0:
-            delta_direct[i] = float(np.sum(weights * target_delta[idx]) / np.sum(weights))
-        else:
-            delta_direct[i] = float(target_delta[idx[0]])
-        weight_max[i] = float(np.max(weights)) if weights.size else 0.0
-        weight_sum[i] = float(np.sum(weights))
-
-    nearest_conf = np.exp(-(nearest_pixel_dist ** 2) / (2.0 * spatial_sigma ** 2)) * np.exp(
-        -(nearest_log_diff ** 2) / (2.0 * sigma_conf_log_range ** 2)
-    )
-    nearest_conf = np.where(np.isfinite(nearest_conf), nearest_conf, 0.0)
-    if confidence_mode == "max_weight":
-        confidence = weight_max
-    elif confidence_mode == "sum_weight":
-        confidence = np.minimum(weight_sum, 1.0)
-    else:
-        confidence = nearest_conf
-    confidence = np.clip(confidence ** float(confidence_power), confidence_min, confidence_max)
-
-    stats = {
-        "nearest_anchor_pixel_dist_mean": float(np.mean(nearest_pixel_dist[np.isfinite(nearest_pixel_dist)]))
-        if np.any(np.isfinite(nearest_pixel_dist))
-        else np.nan,
-        "nearest_anchor_pixel_dist_median": _quantile(nearest_pixel_dist, 0.5),
-        "nearest_anchor_log_range_diff_mean": float(np.mean(nearest_log_diff[np.isfinite(nearest_log_diff)]))
-        if np.any(np.isfinite(nearest_log_diff))
-        else np.nan,
-        "nearest_anchor_log_range_diff_median": _quantile(nearest_log_diff, 0.5),
-        "t_find_nearest_anchor": float(t_query),
-        "t_build_direct_transfer": float(time.perf_counter() - t_weight0),
-    }
-    debug = {
-        "transfer_neighbor_index": neigh_idx,
-        "transfer_neighbor_distance": neigh_dist,
-        "transfer_weight_max": weight_max,
-        "transfer_weight_sum": weight_sum,
-    }
-    return delta_direct, confidence, nearest_pixel_dist, nearest_log_diff, stats, debug
-
-
 def _solve_graph_delta(
     L,
     target_node_indices,
@@ -584,107 +340,6 @@ def _solve_graph_delta(
     return delta_graph, info, solve_residual, A, b
 
 
-def select_residuals(
-    delta_graph,
-    delta_direct,
-    confidence,
-    nearest_log_range_diff,
-    *,
-    selection_mode="confidence_hard",
-    confidence_high_thr=0.8,
-    confidence_low_thr=0.2,
-    direct_log_range_thr=0.05,
-    graph_log_range_thr=0.2,
-):
-    """Select final residuals from graph and direct proposals."""
-    if selection_mode not in SELECTION_MODES:
-        raise ValueError(f"selection_mode must be one of {sorted(SELECTION_MODES)}, got {selection_mode!r}")
-    if confidence_low_thr > confidence_high_thr:
-        raise ValueError("confidence_low_thr must be <= confidence_high_thr")
-    if direct_log_range_thr >= graph_log_range_thr:
-        raise ValueError("direct_log_range_thr must be < graph_log_range_thr")
-
-    delta_graph = np.asarray(delta_graph, dtype=np.float64)
-    delta_direct = np.asarray(delta_direct, dtype=np.float64)
-    confidence = np.asarray(confidence, dtype=np.float64)
-    nearest_log_range_diff = np.asarray(nearest_log_range_diff, dtype=np.float64)
-    if not (
-        delta_graph.shape
-        == delta_direct.shape
-        == confidence.shape
-        == nearest_log_range_diff.shape
-    ):
-        raise ValueError("delta_graph, delta_direct, confidence, and nearest_log_range_diff must have the same shape")
-
-    N = int(delta_graph.size)
-    finite_graph = np.isfinite(delta_graph)
-    finite_direct = np.isfinite(delta_direct)
-    finite_conf = np.isfinite(confidence)
-    finite_dlog = np.isfinite(nearest_log_range_diff)
-    valid_direct = finite_graph & finite_direct & finite_conf & finite_dlog
-
-    confidence_safe = np.where(finite_conf, confidence, 0.0)
-    delta_graph_safe = np.where(finite_graph, delta_graph, 0.0)
-    delta_direct_safe = np.where(finite_direct, delta_direct, delta_graph_safe)
-
-    direct_mask = np.zeros((N,), dtype=bool)
-    graph_mask = np.zeros((N,), dtype=bool)
-    blend_mask = np.zeros((N,), dtype=bool)
-
-    if selection_mode == "soft":
-        direct_mask = valid_direct & (confidence_safe >= float(confidence_high_thr))
-        graph_mask = (~valid_direct) | (confidence_safe <= float(confidence_low_thr))
-        blend_mask = ~(direct_mask | graph_mask)
-        delta_final = confidence_safe * delta_direct_safe + (1.0 - confidence_safe) * delta_graph_safe
-        delta_final[~valid_direct] = delta_graph_safe[~valid_direct]
-
-    elif selection_mode == "confidence_hard":
-        direct_mask = valid_direct & (confidence_safe >= float(confidence_high_thr))
-        graph_mask = (~valid_direct) | (confidence_safe <= float(confidence_low_thr))
-        blend_mask = ~(direct_mask | graph_mask)
-        delta_final = delta_graph_safe.copy()
-        delta_final[direct_mask] = delta_direct_safe[direct_mask]
-        delta_final[blend_mask] = (
-            confidence_safe[blend_mask] * delta_direct_safe[blend_mask]
-            + (1.0 - confidence_safe[blend_mask]) * delta_graph_safe[blend_mask]
-        )
-
-    else:
-        dlog = nearest_log_range_diff
-        direct_mask = valid_direct & (dlog < float(direct_log_range_thr))
-        graph_mask = (~valid_direct) | (dlog >= float(graph_log_range_thr))
-        blend_mask = ~(direct_mask | graph_mask)
-        delta_final = delta_graph_safe.copy()
-        delta_final[direct_mask] = delta_direct_safe[direct_mask]
-        delta_final[blend_mask] = (
-            confidence_safe[blend_mask] * delta_direct_safe[blend_mask]
-            + (1.0 - confidence_safe[blend_mask]) * delta_graph_safe[blend_mask]
-        )
-
-    stats = {
-        "selection_mode": selection_mode,
-        "confidence_high_thr": float(confidence_high_thr),
-        "confidence_low_thr": float(confidence_low_thr),
-        "direct_log_range_thr": float(direct_log_range_thr),
-        "graph_log_range_thr": float(graph_log_range_thr),
-        "selection_direct_count": int(direct_mask.sum()),
-        "selection_graph_count": int(graph_mask.sum()),
-        "selection_blend_count": int(blend_mask.sum()),
-        "selection_direct_ratio": float(direct_mask.sum() / max(N, 1)),
-        "selection_graph_ratio": float(graph_mask.sum() / max(N, 1)),
-        "selection_blend_ratio": float(blend_mask.sum() / max(N, 1)),
-        "selection_invalid_direct_count": int((~finite_direct).sum()),
-        "selection_invalid_conf_count": int((~finite_conf).sum()),
-        "selection_invalid_dlog_count": int((~finite_dlog).sum()),
-    }
-    debug = {
-        "selection_direct_mask": direct_mask,
-        "selection_graph_mask": graph_mask,
-        "selection_blend_mask": blend_mask,
-    }
-    return delta_final, stats, debug
-
-
 def RangeROIGDC(
     pred_range,
     anchor_range,
@@ -707,37 +362,13 @@ def RangeROIGDC(
     sigma_tangent=1.0,
     sigma_log_range=0.3,
     max_log_range_diff=None,
-    transfer_k=1,
-    transfer_neighbor_mode="rowcol",
-    direct_weight_mode="nearest",
-    confidence_mode="nearest",
-    sigma_conf_pixel=2.0,
-    sigma_conf_angular=0.01,
-    sigma_conf_log_range=0.05,
-    confidence_power=2.0,
-    confidence_min=0.0,
-    confidence_max=1.0,
-    selection_mode="confidence_hard",
-    ablation_mode="full",
-    confidence_high_thr=0.8,
-    confidence_low_thr=0.2,
-    direct_log_range_thr=0.05,
-    graph_log_range_thr=0.2,
     delta_clip=0.3,
-    force_anchor_value=None,
     anchor_force_policy="accepted_only",
     return_debug=False,
     return_stats=False,
     verbose=False,
 ):
-    """Confidence-aware residual transfer GDC on guide-valid range bins.
-
-    ``ablation_mode`` controls which residual branch is applied:
-    ``full`` uses the original confidence-aware fusion,
-    ``graph_only`` uses only the graph proposal, and
-    ``direct_only`` uses only valid direct transfers. Nodes without a
-    valid direct proposal remain uncorrected in ``direct_only`` mode.
-    """
+    """Graph-regularized log-range residual correction on guide-valid bins."""
     del verbose
     t0 = time.perf_counter()
     guide_range = np.asarray(pred_range, dtype=np.float32)
@@ -748,27 +379,14 @@ def RangeROIGDC(
         raise ValueError("method must be cg or spsolve")
     if delta_clip is not None and delta_clip <= 0:
         raise ValueError("delta_clip must be positive when set")
-    if force_anchor_value is not None:
-        # Backward-compatible alias used by older configs/tests.
-        anchor_force_policy = "accepted_only" if force_anchor_value else "none"
     if anchor_force_policy not in {"accepted_only", "all_valid", "none"}:
         raise ValueError(
             "anchor_force_policy must be accepted_only, all_valid, or none"
         )
-    if selection_mode not in SELECTION_MODES:
-        raise ValueError(f"selection_mode must be one of {sorted(SELECTION_MODES)}, got {selection_mode!r}")
-    if ablation_mode not in ABLATION_MODES:
-        raise ValueError(
-            f"ablation_mode must be one of {sorted(ABLATION_MODES)}, got {ablation_mode!r}"
-        )
-    if confidence_low_thr > confidence_high_thr:
-        raise ValueError("confidence_low_thr must be <= confidence_high_thr")
-    if direct_log_range_thr >= graph_log_range_thr:
-        raise ValueError("direct_log_range_thr must be < graph_log_range_thr")
 
     H, W_img = guide_range.shape
     stats = {
-        "method_tag": "confidence_residual_transfer",
+        "method_tag": "graph_log_range_residual",
         "status": "ok",
         "H": H,
         "W": W_img,
@@ -792,68 +410,22 @@ def RangeROIGDC(
         "lambda_anchor": float(lambda_anchor),
         "lambda_prior": float(lambda_prior),
         "lambda_smooth": float(lambda_smooth),
-        "transfer_k": int(transfer_k),
-        "transfer_neighbor_mode": transfer_neighbor_mode,
-        "direct_weight_mode": direct_weight_mode,
-        "confidence_mode": confidence_mode,
-        "sigma_conf_pixel": float(sigma_conf_pixel),
-        "sigma_conf_angular": float(sigma_conf_angular),
-        "sigma_conf_log_range": float(sigma_conf_log_range),
-        "confidence_power": float(confidence_power),
-        "confidence_min": float(confidence_min),
-        "confidence_max": float(confidence_max),
-        "selection_mode": selection_mode,
-        "ablation_mode": ablation_mode,
-        "confidence_high_thr": float(confidence_high_thr),
-        "confidence_low_thr": float(confidence_low_thr),
-        "direct_log_range_thr": float(direct_log_range_thr),
-        "graph_log_range_thr": float(graph_log_range_thr),
-        "selection_direct_count": 0,
-        "selection_graph_count": 0,
-        "selection_blend_count": 0,
-        "selection_direct_ratio": 0.0,
-        "selection_graph_ratio": 0.0,
-        "selection_blend_ratio": 0.0,
-        "selection_invalid_direct_count": 0,
-        "selection_invalid_conf_count": 0,
-        "selection_invalid_dlog_count": 0,
-        "selection_uncorrected_count": 0,
-        "selection_uncorrected_ratio": 0.0,
         "delta_clip": "" if delta_clip is None else float(delta_clip),
         "delta_graph_mean": np.nan,
         "delta_graph_std": np.nan,
         "delta_graph_abs_mean": np.nan,
         "propagation_ratio_graph": np.nan,
-        "delta_direct_mean": np.nan,
-        "delta_direct_std": np.nan,
-        "delta_direct_abs_mean": np.nan,
-        "nearest_anchor_pixel_dist_mean": np.nan,
-        "nearest_anchor_pixel_dist_median": np.nan,
-        "nearest_anchor_log_range_diff_mean": np.nan,
-        "nearest_anchor_log_range_diff_median": np.nan,
-        "confidence_mean": np.nan,
-        "confidence_std": np.nan,
-        "confidence_min_value": np.nan,
-        "confidence_max_value": np.nan,
-        "confidence_median": np.nan,
-        "confidence_p10": np.nan,
-        "confidence_p90": np.nan,
-        "confidence_high_ratio": np.nan,
-        "confidence_mid_ratio": np.nan,
-        "confidence_low_ratio": np.nan,
         "delta_final_mean": np.nan,
         "delta_final_std": np.nan,
         "delta_final_abs_mean": np.nan,
-        "delta_final_vs_graph_abs_mean": np.nan,
-        "delta_final_vs_direct_abs_mean": np.nan,
         "anchor_abs_error_before": np.nan,
         "anchor_rmse_before": np.nan,
         "anchor_mae_before_reject": np.nan,
         "anchor_rmse_before_reject": np.nan,
         "anchor_abs_error_after_graph_solve": np.nan,
         "anchor_rmse_after_graph_solve": np.nan,
-        "anchor_abs_error_after_blend": np.nan,
-        "anchor_rmse_after_blend": np.nan,
+        "anchor_abs_error_after_graph": np.nan,
+        "anchor_rmse_after_graph": np.nan,
         "anchor_abs_error_after_force": np.nan,
         "anchor_rmse_after_force": np.nan,
         "corrected_anchor_mae": np.nan,
@@ -869,9 +441,6 @@ def RangeROIGDC(
         "t_build_nodes": 0.0,
         "t_build_graph": 0.0,
         "t_graph_solve": 0.0,
-        "t_find_nearest_anchor": 0.0,
-        "t_build_direct_transfer": 0.0,
-        "t_blend": 0.0,
         "t_total_correction": 0.0,
     }
 
@@ -941,188 +510,55 @@ def RangeROIGDC(
     before_err = guide_range[target_mask] - anchor_range[target_mask]
     stats["anchor_abs_error_before"], stats["anchor_rmse_before"] = _mean_abs_and_rmse(before_err)
 
-    # Ablations do not construct the branch they are intended to remove.  This
-    # keeps their computation and their final residual semantics unambiguous.
-    L = A = b = None
-    graph_debug = {}
-    if ablation_mode == "direct_only":
-        delta_graph = np.full((N,), np.nan, dtype=np.float64)
-    else:
-        t_graph0 = time.perf_counter()
-        L, graph_stats, graph_debug = build_spherical_graph_laplacian(
-            guide_range, guide_valid, node_id, node_rows, node_cols,
-            vertical_centers_deg=vertical_centers_deg,
-            azimuth_centers_deg=azimuth_centers_deg, azimuth_mode=azimuth_mode,
-            neighbor=neighbor, edge_spatial_mode=edge_spatial_mode,
-            sigma_angular=sigma_angular, sigma_tangent=sigma_tangent,
-            sigma_log_range=sigma_log_range, max_log_range_diff=max_log_range_diff,
-        )
-        stats["t_build_graph"] = time.perf_counter() - t_graph0
-        stats.update(graph_stats)
-        t_solve0 = time.perf_counter()
-        delta_graph, info, solve_residual, A, b = _solve_graph_delta(
-            L, target_node_indices, target_delta, method=method,
-            lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
-            lambda_smooth=lambda_smooth,
-        )
-        if delta_clip is not None:
-            delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
-        stats["t_graph_solve"] = time.perf_counter() - t_solve0
-        stats["solver_info"] = str(info)
-        stats["solve_residual"] = solve_residual
-        if info != 0:
-            stats["status"] = f"solver_info_{info}"
-        stats.update(_vector_stats(delta_graph, "delta_graph"))
-        stats["propagation_ratio_graph"] = float(
-            stats["delta_graph_abs_mean"] / max(stats["residual_target_abs_mean"], 1e-12)
-        ) if np.isfinite(stats["delta_graph_abs_mean"]) and np.isfinite(stats["residual_target_abs_mean"]) else np.nan
-        graph_node_values = np.exp(raw_log_nodes + delta_graph).astype(np.float32)
-        corrected_graph = guide_range.copy()
-        corrected_graph[guide_valid] = np.clip(graph_node_values, range_min, range_max)
-        graph_err = corrected_graph[target_mask] - anchor_range[target_mask]
-        stats["anchor_abs_error_after_graph_solve"], stats["anchor_rmse_after_graph_solve"] = _mean_abs_and_rmse(graph_err)
+    t_graph0 = time.perf_counter()
+    L, graph_stats, graph_debug = build_spherical_graph_laplacian(
+        guide_range, guide_valid, node_id, node_rows, node_cols,
+        vertical_centers_deg=vertical_centers_deg,
+        azimuth_centers_deg=azimuth_centers_deg, azimuth_mode=azimuth_mode,
+        neighbor=neighbor, edge_spatial_mode=edge_spatial_mode,
+        sigma_angular=sigma_angular, sigma_tangent=sigma_tangent,
+        sigma_log_range=sigma_log_range, max_log_range_diff=max_log_range_diff,
+    )
+    stats["t_build_graph"] = time.perf_counter() - t_graph0
+    stats.update(graph_stats)
+    t_solve0 = time.perf_counter()
+    delta_graph, info, solve_residual, A, b = _solve_graph_delta(
+        L, target_node_indices, target_delta, method=method,
+        lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
+        lambda_smooth=lambda_smooth,
+    )
+    if delta_clip is not None:
+        delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
+    stats["t_graph_solve"] = time.perf_counter() - t_solve0
+    stats["solver_info"] = str(info)
+    stats["solve_residual"] = solve_residual
+    if info != 0:
+        stats["status"] = f"solver_info_{info}"
+    stats.update(_vector_stats(delta_graph, "delta_graph"))
+    stats["propagation_ratio_graph"] = float(
+        stats["delta_graph_abs_mean"] / max(stats["residual_target_abs_mean"], 1e-12)
+    ) if np.isfinite(stats["delta_graph_abs_mean"]) and np.isfinite(stats["residual_target_abs_mean"]) else np.nan
+    graph_node_values = np.exp(raw_log_nodes + delta_graph).astype(np.float32)
+    corrected_graph_solve = guide_range.copy()
+    corrected_graph_solve[guide_valid] = np.clip(graph_node_values, range_min, range_max)
+    graph_solve_err = corrected_graph_solve[target_mask] - anchor_range[target_mask]
+    stats["anchor_abs_error_after_graph_solve"], stats["anchor_rmse_after_graph_solve"] = _mean_abs_and_rmse(graph_solve_err)
 
-    transfer_debug = {}
-    if ablation_mode == "graph_only":
-        delta_direct = np.full((N,), np.nan, dtype=np.float64)
-        confidence = np.full((N,), np.nan, dtype=np.float64)
-        nearest_dist = np.full((N,), np.nan, dtype=np.float64)
-        nearest_log_diff = np.full((N,), np.nan, dtype=np.float64)
-    else:
-        delta_direct, confidence, nearest_dist, nearest_log_diff, direct_stats, transfer_debug = build_direct_residual_transfer(
-            raw_log_nodes, node_rows, node_cols, target_node_indices, target_delta,
-            shape=guide_range.shape, transfer_k=transfer_k,
-            transfer_neighbor_mode=transfer_neighbor_mode,
-            direct_weight_mode=direct_weight_mode, confidence_mode=confidence_mode,
-            sigma_conf_pixel=sigma_conf_pixel, sigma_conf_angular=sigma_conf_angular,
-            sigma_conf_log_range=sigma_conf_log_range, confidence_power=confidence_power,
-            confidence_min=confidence_min, confidence_max=confidence_max,
-            vertical_centers_deg=vertical_centers_deg,
-            azimuth_centers_deg=azimuth_centers_deg, azimuth_mode=azimuth_mode,
-        )
-        if delta_clip is not None:
-            delta_direct = np.clip(delta_direct, -float(delta_clip), float(delta_clip))
-        stats["t_find_nearest_anchor"] = direct_stats.pop("t_find_nearest_anchor", 0.0)
-        stats["t_build_direct_transfer"] = direct_stats.pop("t_build_direct_transfer", 0.0)
-        stats.update(_vector_stats(delta_direct, "delta_direct"))
-        stats.update(direct_stats)
-    conf_finite = confidence[np.isfinite(confidence)]
-    if conf_finite.size:
-        stats["confidence_mean"] = float(np.mean(conf_finite))
-        stats["confidence_std"] = float(np.std(conf_finite))
-        stats["confidence_min_value"] = float(np.min(conf_finite))
-        stats["confidence_max_value"] = float(np.max(conf_finite))
-        stats["confidence_median"] = float(np.median(conf_finite))
-        stats["confidence_p10"] = _quantile(conf_finite, 0.1)
-        stats["confidence_p90"] = _quantile(conf_finite, 0.9)
-        stats["confidence_high_ratio"] = float(np.mean(conf_finite >= 0.8))
-        stats["confidence_mid_ratio"] = float(np.mean((conf_finite >= 0.2) & (conf_finite < 0.8)))
-        stats["confidence_low_ratio"] = float(np.mean(conf_finite < 0.2))
-
-    t_blend0 = time.perf_counter()
-    if ablation_mode == "full":
-        delta_final, selection_stats, selection_debug = select_residuals(
-            delta_graph=delta_graph,
-            delta_direct=delta_direct,
-            confidence=confidence,
-            nearest_log_range_diff=nearest_log_diff,
-            selection_mode=selection_mode,
-            confidence_high_thr=confidence_high_thr,
-            confidence_low_thr=confidence_low_thr,
-            direct_log_range_thr=direct_log_range_thr,
-            graph_log_range_thr=graph_log_range_thr,
-        )
-        selection_stats["selection_uncorrected_count"] = 0
-        selection_stats["selection_uncorrected_ratio"] = 0.0
-        selection_debug["selection_uncorrected_mask"] = np.zeros((N,), dtype=bool)
-
-    elif ablation_mode == "graph_only":
-        finite_graph = np.isfinite(delta_graph)
-        delta_final = np.where(finite_graph, delta_graph, 0.0)
-        graph_mask = finite_graph.copy()
-        direct_mask = np.zeros((N,), dtype=bool)
-        blend_mask = np.zeros((N,), dtype=bool)
-        uncorrected_mask = ~finite_graph
-        selection_stats = {
-            "selection_mode": selection_mode,
-            "confidence_high_thr": float(confidence_high_thr),
-            "confidence_low_thr": float(confidence_low_thr),
-            "direct_log_range_thr": float(direct_log_range_thr),
-            "graph_log_range_thr": float(graph_log_range_thr),
-            "selection_direct_count": 0,
-            "selection_graph_count": int(graph_mask.sum()),
-            "selection_blend_count": 0,
-            "selection_direct_ratio": 0.0,
-            "selection_graph_ratio": float(graph_mask.sum() / max(N, 1)),
-            "selection_blend_ratio": 0.0,
-            "selection_invalid_direct_count": int((~np.isfinite(delta_direct)).sum()),
-            "selection_invalid_conf_count": int((~np.isfinite(confidence)).sum()),
-            "selection_invalid_dlog_count": int((~np.isfinite(nearest_log_diff)).sum()),
-            "selection_uncorrected_count": int(uncorrected_mask.sum()),
-            "selection_uncorrected_ratio": float(uncorrected_mask.sum() / max(N, 1)),
-        }
-        selection_debug = {
-            "selection_direct_mask": direct_mask,
-            "selection_graph_mask": graph_mask,
-            "selection_blend_mask": blend_mask,
-            "selection_uncorrected_mask": uncorrected_mask,
-        }
-
-    else:  # direct_only
-        # A direct proposal is valid only when a nearest accepted anchor
-        # was found. Do not fall back to the graph branch in this mode.
-        valid_direct = (
-            np.isfinite(delta_direct)
-            & np.isfinite(nearest_log_diff)
-        )
-        delta_final = np.zeros_like(delta_graph, dtype=np.float64)
-        delta_final[valid_direct] = delta_direct[valid_direct]
-        direct_mask = valid_direct.copy()
-        graph_mask = np.zeros((N,), dtype=bool)
-        blend_mask = np.zeros((N,), dtype=bool)
-        uncorrected_mask = ~valid_direct
-        selection_stats = {
-            "selection_mode": selection_mode,
-            "confidence_high_thr": float(confidence_high_thr),
-            "confidence_low_thr": float(confidence_low_thr),
-            "direct_log_range_thr": float(direct_log_range_thr),
-            "graph_log_range_thr": float(graph_log_range_thr),
-            "selection_direct_count": int(direct_mask.sum()),
-            "selection_graph_count": 0,
-            "selection_blend_count": 0,
-            "selection_direct_ratio": float(direct_mask.sum() / max(N, 1)),
-            "selection_graph_ratio": 0.0,
-            "selection_blend_ratio": 0.0,
-            "selection_invalid_direct_count": int((~np.isfinite(delta_direct)).sum()),
-            "selection_invalid_conf_count": int((~np.isfinite(confidence)).sum()),
-            "selection_invalid_dlog_count": int((~np.isfinite(nearest_log_diff)).sum()),
-            "selection_uncorrected_count": int(uncorrected_mask.sum()),
-            "selection_uncorrected_ratio": float(uncorrected_mask.sum() / max(N, 1)),
-        }
-        selection_debug = {
-            "selection_direct_mask": direct_mask,
-            "selection_graph_mask": graph_mask,
-            "selection_blend_mask": blend_mask,
-            "selection_uncorrected_mask": uncorrected_mask,
-        }
-
-    stats.update(selection_stats)
+    # Preserve the former graph_only accepted-anchor treatment exactly: the
+    # accepted target residual is inserted after the solve and clipped again.
+    delta_final = np.where(np.isfinite(delta_graph), delta_graph, 0.0)
     if target_node_indices.size:
-        # Keep the accepted-anchor treatment identical for all variants.
         delta_final[target_node_indices] = target_delta
     if delta_clip is not None:
         delta_final = np.clip(delta_final, -float(delta_clip), float(delta_clip))
-    stats["t_blend"] = time.perf_counter() - t_blend0
     stats.update(_vector_stats(delta_final, "delta_final"))
-    stats["delta_final_vs_graph_abs_mean"] = float(np.mean(np.abs(delta_final - delta_graph))) if N else np.nan
-    stats["delta_final_vs_direct_abs_mean"] = float(np.mean(np.abs(delta_final - delta_direct))) if N else np.nan
 
     corrected_before_force = guide_range.copy()
     final_node_values = np.exp(raw_log_nodes + delta_final).astype(np.float32)
     final_node_values = np.clip(final_node_values, range_min, range_max)
     corrected_before_force[guide_valid] = final_node_values
-    blend_err = corrected_before_force[target_mask] - anchor_range[target_mask]
-    stats["anchor_abs_error_after_blend"], stats["anchor_rmse_after_blend"] = _mean_abs_and_rmse(blend_err)
+    graph_err = corrected_before_force[target_mask] - anchor_range[target_mask]
+    stats["anchor_abs_error_after_graph"], stats["anchor_rmse_after_graph"] = _mean_abs_and_rmse(graph_err)
 
     corrected_range = corrected_before_force.copy()
     if anchor_force_policy == "accepted_only":
@@ -1171,18 +607,12 @@ def RangeROIGDC(
             "A": A,
             "b": b,
             "delta_graph": delta_graph,
-            "delta_direct": delta_direct,
-            "confidence": confidence,
             "delta_final": delta_final,
-            "nearest_anchor_pixel_dist": nearest_dist,
-            "nearest_anchor_log_range_diff": nearest_log_diff,
             "target_node_indices": target_node_indices,
             "target_delta": target_delta,
             "guide_valid": guide_valid,
             "target_mask": target_mask,
-            **selection_debug,
             **graph_debug,
-            **transfer_debug,
         }
 
     if return_stats and return_debug:

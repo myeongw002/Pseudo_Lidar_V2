@@ -1,32 +1,31 @@
+import inspect
 import subprocess
 import sys
 
 import numpy as np
+from scipy import sparse
 
 try:
     from .range_gdc import (
         RangeROIGDC,
-        build_direct_residual_transfer,
+        _apply_anchor_reject,
         build_graph_residual_system,
         build_spherical_graph_laplacian,
-        select_residuals,
         valid_range_mask,
     )
 except ImportError:
     from range_gdc import (
         RangeROIGDC,
-        build_direct_residual_transfer,
+        _apply_anchor_reject,
         build_graph_residual_system,
         build_spherical_graph_laplacian,
-        select_residuals,
         valid_range_mask,
     )
 
 
 def make_fixture():
-    H, W = 8, 16
-    guide = np.zeros((H, W), dtype=np.float32)
-    anchor = np.zeros((H, W), dtype=np.float32)
+    guide = np.zeros((8, 16), dtype=np.float32)
+    anchor = np.zeros_like(guide)
     guide[2:6, 4:12] = 10.0
     anchor[3, 6] = 9.0
     return guide, anchor
@@ -40,268 +39,161 @@ def make_node_index(guide):
     return guide_valid, rows, cols, node_id
 
 
-def test_graph_laplacian_shapes_and_positive_weights():
-    guide, _ = make_fixture()
+def build_laplacian(guide, neighbor="angular_grid8", sigma_angular=0.01):
     guide_valid, rows, cols, node_id = make_node_index(guide)
     L, stats, debug = build_spherical_graph_laplacian(
-        guide,
-        guide_valid,
-        node_id,
-        rows,
-        cols,
-        neighbor="angular_grid8",
-        edge_spatial_mode="angular",
-        sigma_angular=0.01,
-        sigma_log_range=0.3,
+        guide, guide_valid, node_id, rows, cols,
+        neighbor=neighbor, edge_spatial_mode="angular",
+        sigma_angular=sigma_angular, sigma_log_range=0.3,
     )
-    N = int(guide_valid.sum())
-    assert L.shape == (N, N)
+    return guide_valid, rows, cols, node_id, L, stats, debug
+
+
+def test_graph_laplacian_shape_and_positive_weights():
+    guide, _ = make_fixture()
+    guide_valid, _, _, _, L, stats, debug = build_laplacian(guide)
+    assert L.shape == (int(guide_valid.sum()), int(guide_valid.sum()))
     assert stats["N_edges_graph"] > 0
     assert np.all(np.isfinite(debug["edge_weight"]))
     assert np.all(debug["edge_weight"] > 0.0)
 
-    target_idx = np.array([node_id[3, 6]], dtype=np.int64)
-    target_delta = np.array([np.log(9.0 / 10.0)], dtype=np.float64)
+
+def test_horizontal_azimuth_wrap():
+    guide = np.full((1, 4), 10.0, dtype=np.float32)
+    _, _, _, _, _, _, debug = build_laplacian(
+        guide, neighbor="angular_grid4", sigma_angular=10.0,
+    )
+    pairs = {frozenset((int(i), int(j))) for i, j in zip(debug["edge_i"], debug["edge_j"])}
+    assert frozenset((0, 3)) in pairs
+
+
+def test_same_surface_edge_is_stronger_than_range_discontinuity():
+    guide = np.array([[10.0, 10.0, 30.0]], dtype=np.float32)
+    _, _, _, _, _, _, debug = build_laplacian(
+        guide, neighbor="angular_grid4", sigma_angular=10.0,
+    )
+    same = debug["edge_weight"][debug["log_range_diff"] == 0.0]
+    discontinuous = debug["edge_weight"][debug["log_range_diff"] > 0.5]
+    assert same.size and discontinuous.size
+    assert float(np.min(same)) > float(np.max(discontinuous))
+
+
+def test_graph_residual_system_shape_and_anchor_constraint():
+    L = sparse.csr_matrix((3, 3), dtype=np.float64)
     A, b = build_graph_residual_system(
-        L,
-        target_node_indices=target_idx,
-        target_delta=target_delta,
-        lambda_anchor=300.0,
-        lambda_prior=0.05,
-        lambda_smooth=1.0,
+        L, np.array([1]), np.array([0.25]),
+        lambda_anchor=300.0, lambda_prior=0.1, lambda_smooth=1.0,
     )
-    assert A.shape == (N, N)
-    assert b.shape == (N,)
+    assert A.shape == (3, 3) and b.shape == (3,)
+    assert np.isclose(A[1, 1], 300.1)
+    assert np.isclose(b[1], 75.0)
+    assert np.count_nonzero(b) == 1
 
 
-def test_select_residuals_soft():
-    final, stats, _ = select_residuals(
-        np.array([0.0, 0.0]),
-        np.array([1.0, -1.0]),
-        np.array([0.25, 0.75]),
-        np.array([0.01, 0.3]),
-        selection_mode="soft",
+def test_binary_rejection_threshold_boundary():
+    guide = np.array([[10.0, 10.0]], dtype=np.float32)
+    anchor = np.array([[12.0, 11.999]], dtype=np.float32)
+    kept, rejected = _apply_anchor_reject(
+        np.ones_like(guide, dtype=bool), guide, anchor, "abs", 0.4, 2.0,
     )
-    assert np.allclose(final, [0.25, -0.75])
-    assert stats["selection_direct_count"] + stats["selection_graph_count"] + stats["selection_blend_count"] == 2
+    assert kept.tolist() == [[False, True]]
+    assert rejected == 1
 
 
-def test_select_residuals_confidence_hard():
-    graph = np.array([0.0, 0.0, 0.0])
-    direct = np.array([1.0, -1.0, 2.0])
-    conf = np.array([0.9, 0.1, 0.5])
-    dlog = np.array([0.01, 0.01, 0.01])
-    final, stats, _ = select_residuals(
-        graph,
-        direct,
-        conf,
-        dlog,
-        selection_mode="confidence_hard",
-        confidence_high_thr=0.8,
-        confidence_low_thr=0.2,
-    )
-    assert np.allclose(final, [1.0, 0.0, 1.0])
-    assert stats["selection_direct_count"] == 1
-    assert stats["selection_graph_count"] == 1
-    assert stats["selection_blend_count"] == 1
-
-
-def test_select_residuals_log_range_piecewise():
-    graph = np.array([0.0, 0.0, 0.0])
-    direct = np.array([1.0, -1.0, 2.0])
-    conf = np.array([0.4, 0.4, 0.4])
-    dlog = np.array([0.01, 0.3, 0.1])
-    final, stats, _ = select_residuals(
-        graph,
-        direct,
-        conf,
-        dlog,
-        selection_mode="log_range_piecewise",
-        direct_log_range_thr=0.05,
-        graph_log_range_thr=0.2,
-    )
-    assert np.allclose(final, [1.0, 0.0, 0.8])
-    assert stats["selection_direct_count"] == 1
-    assert stats["selection_graph_count"] == 1
-    assert stats["selection_blend_count"] == 1
-
-
-def test_select_residuals_invalid_fallback():
-    final_direct_nan, stats_direct_nan, _ = select_residuals(
-        np.array([0.2]),
-        np.array([np.nan]),
-        np.array([1.0]),
-        np.array([0.01]),
-        selection_mode="log_range_piecewise",
-    )
-    assert np.allclose(final_direct_nan, [0.2])
-    assert stats_direct_nan["selection_graph_count"] == 1
-    assert stats_direct_nan["selection_invalid_direct_count"] == 1
-
-    final_dlog_nan, stats_dlog_nan, _ = select_residuals(
-        np.array([0.2]),
-        np.array([1.0]),
-        np.array([1.0]),
-        np.array([np.nan]),
-        selection_mode="log_range_piecewise",
-    )
-    assert np.allclose(final_dlog_nan, [0.2])
-    assert stats_dlog_nan["selection_graph_count"] == 1
-    assert stats_dlog_nan["selection_invalid_dlog_count"] == 1
-
-
-def test_range_consistent_direct_transfer():
-    guide, anchor = make_fixture()
-    corrected, mask, stats, debug = RangeROIGDC(
-        guide,
-        anchor,
-        method="spsolve",
-        anchor_reject="none",
-        lambda_anchor=300.0,
-        lambda_prior=0.05,
-        lambda_smooth=1.0,
-        sigma_conf_pixel=4.0,
-        sigma_conf_log_range=0.2,
-        selection_mode="log_range_piecewise",
-        direct_log_range_thr=0.05,
-        graph_log_range_thr=0.2,
-        delta_clip=0.5,
-        force_anchor_value=False,
-        return_stats=True,
-        return_debug=True,
-    )
-    hidden = debug["node_id"][3, 7]
-    expected = np.log(9.0 / 10.0)
-    assert stats["confidence_high_ratio"] > 0.0
-    assert stats["selection_direct_count"] > 0
-    assert abs(debug["delta_direct"][hidden] - expected) < 1e-6
-    assert abs(debug["delta_final"][hidden] - debug["delta_direct"][hidden]) < abs(
-        debug["delta_graph"][hidden] - debug["delta_direct"][hidden]
-    )
-    assert abs(float(corrected[3, 7]) - 9.0) < 0.2
-    assert np.array_equal(mask, guide > 0)
-
-
-def test_range_discontinuous_fallback():
-    H, W = 6, 8
-    guide = np.zeros((H, W), dtype=np.float32)
-    anchor = np.zeros((H, W), dtype=np.float32)
-    guide[2, 2] = 10.0
-    guide[2, 3] = 40.0
-    guide[2, 4] = 40.0
-    anchor[2, 2] = 8.0
-
+def test_delta_clipping():
+    guide = np.array([[10.0]], dtype=np.float32)
+    anchor = np.array([[30.0]], dtype=np.float32)
     corrected, _, _, debug = RangeROIGDC(
-        guide,
-        anchor,
-        method="spsolve",
-        anchor_reject="none",
-        lambda_anchor=300.0,
-        lambda_prior=0.05,
-        lambda_smooth=1.0,
-        sigma_conf_pixel=4.0,
-        sigma_conf_log_range=0.05,
-        selection_mode="log_range_piecewise",
-        direct_log_range_thr=0.05,
-        graph_log_range_thr=0.2,
-        delta_clip=0.5,
-        force_anchor_value=False,
-        return_stats=True,
-        return_debug=True,
+        guide, anchor, method="spsolve", anchor_reject="none",
+        delta_clip=0.3, anchor_force_policy="none",
+        return_stats=True, return_debug=True,
     )
-    target_node = debug["node_id"][2, 3]
-    assert debug["confidence"][target_node] < 0.01
-    assert debug["selection_graph_mask"][target_node]
-    assert abs(debug["delta_final"][target_node] - debug["delta_graph"][target_node]) < abs(
-        debug["delta_final"][target_node] - debug["delta_direct"][target_node]
-    )
-    assert corrected[2, 3] > 30.0
+    assert np.isclose(debug["target_delta"][0], 0.3)
+    assert np.isclose(debug["delta_final"][0], 0.3)
+    assert np.isclose(corrected[0, 0], 10.0 * np.exp(0.3), rtol=1e-6)
 
 
-def test_confidence_monotonicity():
-    raw_log_nodes = np.log(np.array([10.0, 10.1, 11.0, 16.5], dtype=np.float64))
-    rows = np.array([0, 0, 0, 0], dtype=np.int64)
-    cols = np.array([0, 1, 2, 3], dtype=np.int64)
-    target_idx = np.array([0], dtype=np.int64)
-    target_delta = np.array([np.log(9.0 / 10.0)], dtype=np.float64)
-    _, conf, _, _, _, _ = build_direct_residual_transfer(
-        raw_log_nodes,
-        rows,
-        cols,
-        target_idx,
-        target_delta,
-        shape=(1, 16),
-        transfer_k=1,
-        transfer_neighbor_mode="rowcol",
-        direct_weight_mode="nearest",
-        confidence_mode="nearest",
-        sigma_conf_pixel=100.0,
-        sigma_conf_log_range=0.1,
-    )
-    assert conf[1] > conf[2] > conf[3]
-
-
-def test_output_mask_excludes_guide_invalid_and_force_anchor():
+def test_accepted_only_force_uses_anchor_range():
     guide, anchor = make_fixture()
-    corrected, mask, stats = RangeROIGDC(
-        guide,
-        anchor,
-        method="spsolve",
-        anchor_reject="none",
-        force_anchor_value=True,
-        return_stats=True,
+    corrected, _, stats = RangeROIGDC(
+        guide, anchor, method="spsolve", anchor_reject="none",
+        anchor_force_policy="accepted_only", return_stats=True,
     )
-    target = (guide > 0) & (anchor > 0)
-    expected = (guide > 0) & np.isfinite(corrected) & (corrected >= 1.0) & (corrected <= 80.0)
-    assert np.array_equal(mask, expected)
-    assert not np.any(mask[guide <= 0])
-    assert np.allclose(corrected[target], anchor[target])
-    assert stats["anchor_abs_error_after_force"] == 0.0
+    target = valid_range_mask(guide) & valid_range_mask(anchor)
+    assert np.array_equal(corrected[target], anchor[target])
+    assert stats["anchor_forced_count"] == int(target.sum())
 
 
-def test_anchor_overlap_before_reject_count():
-    guide = np.zeros((4, 4), dtype=np.float32)
-    anchor = np.zeros((4, 4), dtype=np.float32)
-    guide[1, 1] = 10.0
-    guide[1, 2] = 10.0
-    anchor[1, 1] = 8.0
-    anchor[1, 2] = 1.0
-
-    _, _, stats = RangeROIGDC(
-        guide,
-        anchor,
-        method="spsolve",
-        anchor_reject="log_ratio",
-        log_ratio_thr=0.4,
-        force_anchor_value=False,
-        return_stats=True,
+def test_rejected_anchor_is_not_forced():
+    guide = np.array([[10.0]], dtype=np.float32)
+    anchor = np.array([[12.0]], dtype=np.float32)
+    corrected, _, stats = RangeROIGDC(
+        guide, anchor, method="spsolve", anchor_reject="abs",
+        abs_error_thr=2.0, anchor_force_policy="accepted_only", return_stats=True,
     )
-    assert stats["N_anchor_overlap"] == 2
-    assert stats["N_residual_targets"] == 1
-    assert stats["N_rejected_residual_targets"] == 1
+    assert corrected[0, 0] == guide[0, 0]
+    assert corrected[0, 0] != anchor[0, 0]
+    assert stats["anchor_reject_count"] == 1
+    assert stats["anchor_forced_count"] == 0
 
 
-def test_old_bias_cli_removed():
-    cmd = [sys.executable, "-m", "range_gdc.range_main_batch", "--help"]
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    assert "global_bias_mode" not in result.stdout
-    assert "bias_spherical_graph" not in result.stdout
-    assert "transfer_k" in result.stdout
-    assert "selection_mode" in result.stdout
+def test_output_mask_preserves_guide_valid_domain():
+    guide, anchor = make_fixture()
+    anchor[0, 0] = 5.0
+    _, mask = RangeROIGDC(guide, anchor, method="spsolve", anchor_reject="none")
+    assert np.array_equal(mask, valid_range_mask(guide))
+    assert not mask[0, 0]
+
+
+def test_empty_node_behavior():
+    guide = np.zeros((2, 3), dtype=np.float32)
+    corrected, mask, stats = RangeROIGDC(guide, guide, return_stats=True)
+    assert np.array_equal(corrected, guide)
+    assert not np.any(mask)
+    assert stats["status"] == "empty_nodes"
+
+
+def test_cg_and_spsolve_sanity():
+    guide, anchor = make_fixture()
+    outputs = []
+    for method in ("cg", "spsolve"):
+        corrected, mask, stats = RangeROIGDC(
+            guide, anchor, method=method, anchor_reject="none", return_stats=True,
+        )
+        assert stats["solver_info"] == "0"
+        assert np.all(np.isfinite(corrected[mask]))
+        outputs.append(corrected)
+    assert np.allclose(outputs[0], outputs[1], atol=1e-5, rtol=1e-5)
+
+
+def test_legacy_api_and_cli_removed():
+    parameters = inspect.signature(RangeROIGDC).parameters
+    for name in (
+        "transfer_k", "confidence_mode", "selection_mode", "ablation_mode",
+        "force_anchor_value",
+    ):
+        assert name not in parameters
+    result = subprocess.run(
+        [sys.executable, "-m", "range_gdc.range_main_batch", "--help"],
+        check=True, capture_output=True, text=True,
+    )
+    for flag in ("transfer_k", "confidence_mode", "selection_mode", "ablation_mode", "force_anchor_value"):
+        assert flag not in result.stdout
 
 
 def main():
-    test_graph_laplacian_shapes_and_positive_weights()
-    test_select_residuals_soft()
-    test_select_residuals_confidence_hard()
-    test_select_residuals_log_range_piecewise()
-    test_select_residuals_invalid_fallback()
-    test_range_consistent_direct_transfer()
-    test_range_discontinuous_fallback()
-    test_confidence_monotonicity()
-    test_output_mask_excludes_guide_invalid_and_force_anchor()
-    test_anchor_overlap_before_reject_count()
-    test_old_bias_cli_removed()
+    test_graph_laplacian_shape_and_positive_weights()
+    test_horizontal_azimuth_wrap()
+    test_same_surface_edge_is_stronger_than_range_discontinuity()
+    test_graph_residual_system_shape_and_anchor_constraint()
+    test_binary_rejection_threshold_boundary()
+    test_delta_clipping()
+    test_accepted_only_force_uses_anchor_range()
+    test_rejected_anchor_is_not_forced()
+    test_output_mask_preserves_guide_valid_domain()
+    test_empty_node_behavior()
+    test_cg_and_spsolve_sanity()
+    test_legacy_api_and_cli_removed()
     print("range_gdc_sanity: OK")
 
 
