@@ -198,53 +198,13 @@ def load_meta_info(args):
         "meta_path": meta_path,
         "height": scalar_from_npz(meta, "height"),
         "width": scalar_from_npz(meta, "width"),
-        "row_offset": scalar_from_npz(meta, "row_offset"),
-        "row_stride": scalar_from_npz(meta, "row_stride"),
         "azimuth_mode": scalar_from_npz(meta, "azimuth_mode", "full_360_front_centered"),
     }
-    if "selected_rows" in meta.files:
-        info["selected_rows"] = meta["selected_rows"].astype(np.int32)
     if "vertical_centers_deg" in meta.files:
         info["vertical_centers_deg"] = meta["vertical_centers_deg"].astype(np.float64)
     if "azimuth_centers_deg" in meta.files:
         info["azimuth_centers_deg"] = meta["azimuth_centers_deg"].astype(np.float64)
     return info
-
-
-def get_selected_rows_from_meta(meta_info):
-    selected_rows = meta_info.get("selected_rows")
-    if selected_rows is not None:
-        return np.asarray(selected_rows, dtype=np.int32)
-
-    height = meta_info.get("height")
-    row_offset = meta_info.get("row_offset")
-    row_stride = meta_info.get("row_stride")
-    if height is None or row_offset is None or row_stride is None:
-        return None
-    return np.arange(int(row_offset), int(height), int(row_stride), dtype=np.int32)
-
-
-def expand_lowres_anchor_to_full(low_range, target_shape, selected_rows, invalid_value=0.0):
-    H, W = target_shape
-    low_range = np.asarray(low_range, dtype=np.float32)
-    selected_rows = np.asarray(selected_rows, dtype=np.int32)
-    if low_range.ndim != 2:
-        raise ValueError(f"low_range must be 2D, got shape {low_range.shape}")
-    if low_range.shape[1] != W:
-        raise ValueError(f"low_range width {low_range.shape[1]} does not match target width {W}")
-    if low_range.shape[0] != len(selected_rows):
-        raise ValueError(
-            f"low_range height {low_range.shape[0]} does not match len(selected_rows)={len(selected_rows)}"
-        )
-    if np.any(selected_rows < 0) or np.any(selected_rows >= H):
-        raise ValueError(f"selected_rows contain rows outside target height {H}")
-
-    anchor = np.full((H, W), invalid_value, dtype=np.float32)
-    valid_low = np.isfinite(low_range) & (low_range > 0)
-    anchor_rows = anchor[selected_rows, :]
-    anchor_rows[valid_low] = low_range[valid_low]
-    anchor[selected_rows, :] = anchor_rows
-    return anchor
 
 
 def corrected_output_paths(output_path, mask_output_path, scene_id, H):
@@ -262,7 +222,7 @@ def process_one(task):
         anchor_file,
         output_path,
         mask_output_path,
-        selected_rows,
+        projection_shape,
         vertical_centers_deg,
         azimuth_centers_deg,
         azimuth_mode,
@@ -273,15 +233,19 @@ def process_one(task):
     anchor_input = np.load(anchor_file).astype(np.float32)
     if pred.ndim != 2:
         raise ValueError(f"{scene_id}: pred range must be 2D, got {pred.shape}")
-    if anchor_input.shape == pred.shape:
-        anchor = anchor_input
-    else:
-        if selected_rows is None:
-            raise ValueError(
-                f"{scene_id}: anchor shape {anchor_input.shape} does not match pred {pred.shape}, "
-                "and selected_rows is unavailable. Provide --projection_meta_path or --meta_dir."
-            )
-        anchor = expand_lowres_anchor_to_full(anchor_input, pred.shape, selected_rows)
+    if anchor_input.ndim != 2:
+        raise ValueError(f"{scene_id}: canonical Range-GDC anchor must be 2D, got {anchor_input.shape}")
+    if projection_shape is not None and pred.shape != projection_shape:
+        raise ValueError(
+            f"{scene_id}: prediction shape {pred.shape} does not match "
+            f"projection metadata shape {projection_shape}"
+        )
+    if anchor_input.shape != pred.shape:
+        raise ValueError(
+            f"{scene_id}: canonical Range-GDC anchor shape {anchor_input.shape} "
+            f"does not match prediction shape {pred.shape}"
+        )
+    anchor = anchor_input
 
     range_file, mask_file = corrected_output_paths(output_path, mask_output_path, scene_id, pred.shape[0])
     if (not args_dict["overwrite"]) and osp.exists(range_file) and osp.exists(mask_file):
@@ -412,7 +376,15 @@ def main():
         scene_ids = scene_ids[: args.max_items]
 
     meta_info = load_meta_info(args)
-    selected_rows = get_selected_rows_from_meta(meta_info)
+    meta_height = meta_info.get("height")
+    meta_width = meta_info.get("width")
+    if (meta_height is None) != (meta_width is None):
+        raise ValueError("projection metadata must define both height and width")
+    projection_shape = (
+        None
+        if meta_height is None
+        else (int(meta_height), int(meta_width))
+    )
     vertical_centers_deg = meta_info.get("vertical_centers_deg")
     azimuth_centers_deg = meta_info.get("azimuth_centers_deg")
     azimuth_mode = str(meta_info.get("azimuth_mode", "full_360_front_centered"))
@@ -428,7 +400,7 @@ def main():
             anchor_files[scene_id],
             args.output_path,
             args.mask_output_path,
-            selected_rows,
+            projection_shape,
             vertical_centers_deg,
             azimuth_centers_deg,
             azimuth_mode,

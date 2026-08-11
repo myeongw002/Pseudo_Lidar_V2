@@ -7,6 +7,7 @@ import numpy as np
 
 from range_gdc.evaluate_range_metrics import leakage_row
 from range_gdc.build_range_anchor import process_one
+from range_gdc import range_main_batch as range_batch
 from range_gdc.range_gdc import RangeROIGDC, _apply_anchor_reject
 from range_gdc.range_main_batch import npy_map, select_scene_ids
 from range_gdc.range_projection import range_to_velo
@@ -407,6 +408,94 @@ class PaperPipelineTests(unittest.TestCase):
             "leakage_warn_err_zero_ratio": 0.01, "leakage_warn_err_5cm_ratio": 0.8})()
         with self.assertRaises(ValueError):
             leakage_row(0, {"range_gdc": gt.copy()}, gt, anchor, args)
+
+    @staticmethod
+    def batch_args():
+        return {
+            "overwrite": True,
+            "method": "spsolve",
+            "range_min": 0.1,
+            "range_max": 80.0,
+            "anchor_reject": "none",
+            "log_ratio_thr": 0.4,
+            "abs_error_thr": 2.0,
+            "lambda_anchor": 300.0,
+            "lambda_prior": 0.1,
+            "lambda_smooth": 1.0,
+            "neighbor": "angular_grid8",
+            "edge_spatial_mode": "angular",
+            "sigma_angular": 0.01,
+            "sigma_tangent": 1.0,
+            "sigma_log_range": 0.3,
+            "max_log_range_diff": None,
+            "delta_clip": 0.3,
+            "anchor_force_policy": "accepted_only",
+            "verbose": False,
+        }
+
+    def test_range_batch_accepts_full_shape_canonical_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pred_file, anchor_file = root / "pred.npy", root / "anchor.npy"
+            output, masks = root / "output", root / "masks"
+            pred = np.full((4, 5), 10.0, dtype=np.float32)
+            pred[0, 0] = 0.0
+            anchor = np.zeros_like(pred)
+            anchor[1, 2] = 9.0
+            np.save(pred_file, pred)
+            np.save(anchor_file, anchor)
+            args = self.batch_args()
+            expected, expected_mask = RangeROIGDC(
+                pred, anchor,
+                method=args["method"], range_min=args["range_min"], range_max=args["range_max"],
+                anchor_reject=args["anchor_reject"], log_ratio_thr=args["log_ratio_thr"],
+                abs_error_thr=args["abs_error_thr"], lambda_anchor=args["lambda_anchor"],
+                lambda_prior=args["lambda_prior"], lambda_smooth=args["lambda_smooth"],
+                neighbor=args["neighbor"], edge_spatial_mode=args["edge_spatial_mode"],
+                sigma_angular=args["sigma_angular"], sigma_tangent=args["sigma_tangent"],
+                sigma_log_range=args["sigma_log_range"], delta_clip=args["delta_clip"],
+                anchor_force_policy=args["anchor_force_policy"],
+            )
+            range_batch.process_one((
+                "000000", str(pred_file), str(anchor_file), str(output), str(masks),
+                pred.shape, None, None, "full_360_front_centered", args,
+            ))
+            actual = np.load(output / "000000_G4_corr_range.npy")
+            actual_mask = np.load(masks / "000000_G4_corr_mask.npy")
+            self.assertTrue(np.array_equal(actual, expected))
+            self.assertTrue(np.array_equal(actual_mask, expected_mask))
+
+    def test_range_batch_rejects_compact_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pred_file, anchor_file = root / "pred.npy", root / "anchor.npy"
+            np.save(pred_file, np.ones((64, 1024), dtype=np.float32))
+            np.save(anchor_file, np.ones((4, 1024), dtype=np.float32))
+            task = (
+                "000000", str(pred_file), str(anchor_file), str(root / "out"),
+                str(root / "mask"), (64, 1024), None, None,
+                "full_360_front_centered", {},
+            )
+            with self.assertRaisesRegex(ValueError, "canonical Range-GDC anchor shape"):
+                range_batch.process_one(task)
+
+    def test_range_batch_rejects_projection_metadata_shape_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pred_file, anchor_file = root / "pred.npy", root / "anchor.npy"
+            np.save(pred_file, np.ones((4, 5), dtype=np.float32))
+            np.save(anchor_file, np.ones((4, 5), dtype=np.float32))
+            task = (
+                "000000", str(pred_file), str(anchor_file), str(root / "out"),
+                str(root / "mask"), (64, 1024), None, None,
+                "full_360_front_centered", {},
+            )
+            with self.assertRaisesRegex(ValueError, "projection metadata shape"):
+                range_batch.process_one(task)
+
+    def test_low_resolution_anchor_helpers_are_absent(self):
+        self.assertFalse(hasattr(range_batch, "get_selected_rows_from_meta"))
+        self.assertFalse(hasattr(range_batch, "expand_lowres_anchor_to_full"))
 
     def test_range_main_batch_split_filtering_requires_every_input_frame(self):
         with tempfile.TemporaryDirectory() as directory:
