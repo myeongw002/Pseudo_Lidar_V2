@@ -601,3 +601,60 @@ leakage status = OK
 Report modified files, removed default stages, new CLI options, and example commands.
 
 
+
+
+
+for PARAM in \
+  "C2 4 0.20 1" \
+  "C4 8 0.20 1" \
+  "C5 8 0.30 1"
+do
+  set -- $PARAM
+
+  NAME=$1
+  PIX=$2
+  LOG=$3
+  POW=$4
+
+  echo "=========================================="
+  echo "$NAME: sigma_pixel=$PIX sigma_log=$LOG power=$POW"
+  echo "=========================================="
+
+  python3 -B range_gdc/range_main_batch.py \
+    --pred_path "$PRED" \
+    --anchor_path "$ANCHOR" \
+    --split_file "$SPLIT" \
+    --output_path "$ROOT/range/conf_${NAME}_1000/G64_range" \
+    --mask_output_path "$ROOT/range/conf_${NAME}_1000/G64_mask" \
+    --projection_meta_path "$META" \
+    --stats_csv "$ROOT/range/conf_${NAME}_1000/meta/stats.csv" \
+    --method cg \
+    --range_min 0.1 \
+    --range_max 80.0 \
+    --anchor_reject abs \
+    --abs_error_thr 2.0 \
+    --log_ratio_thr 0.4 \
+    --lambda_anchor 300.0 \
+    --lambda_prior 0.1 \
+    --lambda_smooth 1.0 \
+    --neighbor angular_grid8 \
+    --edge_spatial_mode angular \
+    --sigma_angular 0.01 \
+    --sigma_log_range 0.3 \
+    --transfer_k 3 \
+    --transfer_neighbor_mode rowcol \
+    --direct_weight_mode weighted_knn \
+    --confidence_mode nearest \
+    --sigma_conf_pixel "$PIX" \
+    --sigma_conf_log_range "$LOG" \
+    --confidence_power "$POW" \
+    --confidence_high_thr 0.8 \
+    --confidence_low_thr 0.2 \
+    --selection_mode soft \
+    --ablation_mode full \
+    --delta_clip 0.3 \
+    --anchor_force_policy accepted_only \
+    --threads 4 \
+    --overwrite
+
+done
