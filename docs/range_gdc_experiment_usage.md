@@ -4,7 +4,7 @@ The canonical entry point is:
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml
+  --config configs/r64_pipeline.yaml
 ```
 
 ## Method
@@ -32,10 +32,10 @@ not complete missing cells.
 
 ## Experimental continuous anchor reliability
 
-The canonical configs explicitly use `anchor_reliability_mode: uniform`, so
+The canonical config explicitly uses `anchor_reliability_mode: uniform`, so
 every anchor accepted by hard rejection has `q = 1` and retains the baseline
-system exactly. The train-1000 experimental config uses `quadratic`: after the
-same hard rejection, each accepted anchor receives
+system exactly. Quadratic mode is selected with a CLI override: after the same
+hard rejection, each accepted anchor receives
 `q = 1 - (d / tau)^2` for `d < tau`; anchors with `d >= tau` have `q = 0`
 and are removed from the graph target set by hard rejection. Each accepted
 anchor's graph constraint becomes `lambda_anchor * q`. Here `d` is the
@@ -49,7 +49,10 @@ target-cell/cell-level confidence path.
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_anchor_reliability_train1000.yaml
+  --config configs/r64_pipeline.yaml \
+  --split-file ./split/train_1000_seed2026.txt \
+  --output-root /data/kitti/pseudo_lidar_anchor_reliability_train1000 \
+  --anchor-reliability-mode quadratic
 ```
 
 ## Canonical stages
@@ -72,37 +75,56 @@ evaluate
 
 Stage names are exact; the runner does not translate historical names.
 
-## Dry runs
+## Single-config experiment commands
+
+Canonical validation baseline:
 
 ```bash
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
-  --dry-run
-
-python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical_val.yaml \
-  --dry-run
+  --config configs/r64_pipeline.yaml
 ```
 
-Use a fresh `output_root` for an actual run. Resume validation checks each
-stage's expected artifacts before deciding whether to skip it.
+Train-1000 uniform control:
+
+```bash
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline.yaml \
+  --split-file ./split/train_1000_seed2026.txt \
+  --output-root /data/kitti/pseudo_lidar_uniform_train1000 \
+  --anchor-reliability-mode uniform
+```
+
+Train-1000 quadratic experiment:
+
+```bash
+python3 -B tools/run_range_gdc_experiment.py \
+  --config configs/r64_pipeline.yaml \
+  --split-file ./split/train_1000_seed2026.txt \
+  --output-root /data/kitti/pseudo_lidar_anchor_reliability_train1000 \
+  --anchor-reliability-mode quadratic
+```
+
+The runner derives the canonical LiDAR source from `kitti_root/velodyne`;
+`anchor.source_ptc_path` is not supported. Use `--dry-run` with any command to
+inspect it. Resume validation checks each stage's expected artifacts before
+deciding whether to skip it.
 
 ## Stage selection
 
 ```bash
 # Evaluation only
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
+  --config configs/r64_pipeline.yaml \
   --only-stage evaluate --force-stage evaluate
 
 # Rebuild the canonical range anchor and downstream stages
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
+  --config configs/r64_pipeline.yaml \
   --force-from range_anchor_from_shared_anchor
 
 # Rerun correction and evaluation
 python3 -B tools/run_range_gdc_experiment.py \
-  --config configs/r64_pipeline_canonical.yaml \
+  --config configs/r64_pipeline.yaml \
   --stages range_gdc,evaluate --force
 ```
 
@@ -154,7 +176,7 @@ python3 -B tools/audit_anchor_rejection_consistency.py \
   --output-root <root> \
   --split-file <split> \
   --kitti-root <kitti-root> \
-  --config configs/r64_pipeline_canonical.yaml
+  --config configs/r64_pipeline.yaml
 ```
 
 Evaluation excludes exactly the configured source rows and retains the

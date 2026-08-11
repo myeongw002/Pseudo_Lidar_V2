@@ -355,31 +355,110 @@ class PaperPipelineTests(unittest.TestCase):
             stages = pipeline.build_stages(context)
             self.assertIn("canonical_shared_anchor", stages)
             self.assertIn("range_anchor_from_shared_anchor", stages)
+            anchor_command = stages["canonical_shared_anchor"].commands_fn()[0]
+            self.assertEqual(
+                anchor_command[anchor_command.index("--velodyne-dir") + 1],
+                str(root / "kitti" / "velodyne"),
+            )
             command = stages["range_anchor_from_shared_anchor"].commands_fn()[0]
             self.assertTrue(command[1].endswith("range_gdc/build_range_anchor.py"))
             self.assertNotIn("--mode", command)
 
-    def test_checked_in_canonical_config_is_explicit_graph_only(self):
-        config = pipeline.load_yaml(str(Path(__file__).parents[1] / "configs" / "r64_pipeline_canonical.yaml"))
+    def test_single_pipeline_config_is_canonical_uniform(self):
+        root = Path(__file__).parents[1]
+        pipeline_configs = sorted((root / "configs").glob("r64_pipeline*.yaml"))
+        self.assertEqual([path.name for path in pipeline_configs], ["r64_pipeline.yaml"])
+        config = pipeline.load_yaml(str(pipeline_configs[0]))
         range_cfg = config["range_gdc"]
+        self.assertEqual(config["kitti_root"], "/data/kitti/kitti_object/training")
         self.assertEqual(range_cfg["neighbor"], "angular_grid8")
         self.assertEqual(range_cfg["lambda_anchor"], 300.0)
         self.assertEqual(range_cfg["anchor_reliability_mode"], "uniform")
+        self.assertNotIn("source_ptc_path", config["anchor"])
         for name in ("selection_mode", "confidence_mode", "transfer_k", "ablation_mode"):
             self.assertNotIn(name, range_cfg)
 
-    def test_anchor_reliability_train1000_config_is_quadratic_only_variant(self):
-        root = Path(__file__).parents[1]
-        canonical = pipeline.load_yaml(
-            str(root / "configs" / "r64_pipeline_canonical_train1000.yaml")
-        )
-        experimental = pipeline.load_yaml(
-            str(root / "configs" / "r64_pipeline_anchor_reliability_train1000.yaml")
-        )
-        self.assertNotEqual(canonical["output_root"], experimental["output_root"])
-        canonical["output_root"] = experimental["output_root"]
-        canonical["range_gdc"]["anchor_reliability_mode"] = "quadratic"
-        self.assertEqual(canonical, experimental)
+    def test_pipeline_cli_overrides_split_output_and_reliability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_split = root / "val.txt"
+            override_split = root / "train_1000_seed2026.txt"
+            config_split.write_text("0\n")
+            override_split.write_text("1\n")
+            cfg = {
+                "output_root": str(root / "config-output"),
+                "kitti_root": str(root / "config-kitti"),
+                "split_file": str(config_split),
+                "data_tag": "canonical",
+                "anchor": {"mode": "shared_canonical", "selected_rows": [5, 7, 9, 11]},
+                "range_anchor": {"mode": "shared_canonical", "selected_rows": [5, 7, 9, 11]},
+                "range_gdc": {
+                    "anchor_reliability_mode": "uniform",
+                    "lambda_anchor": 300.0,
+                    "lambda_prior": 0.1,
+                    "lambda_smooth": 1.0,
+                },
+            }
+
+            def make_args(mode):
+                return type("Args", (), {
+                    "config": "unused.yaml", "threads": None, "data_tag": None,
+                    "output_root": str(root / "cli-output"),
+                    "kitti_root": "/data/kitti/kitti_object/training",
+                    "split_file": str(override_split), "anchor_reliability_mode": mode,
+                    "sdn_config": None, "sdn_checkpoint": None,
+                    "no_distance_eval": True,
+                })()
+
+            contexts = []
+            for mode in ("uniform", "quadratic"):
+                with mock.patch.object(pipeline, "load_yaml", return_value=cfg), \
+                        mock.patch.object(pipeline, "read_split_ids", return_value=["000001"]):
+                    contexts.append(pipeline.build_context(make_args(mode)))
+            uniform, quadratic = contexts
+            self.assertEqual(quadratic["paths"]["output_root"], root / "cli-output")
+            self.assertEqual(quadratic["paths"]["split_file"], override_split)
+            self.assertEqual(quadratic["data_tag"], "train_1000_seed2026")
+            self.assertEqual(quadratic["range_gdc"]["anchor_reliability_mode"], "quadratic")
+            self.assertEqual(
+                quadratic["paths"]["velodyne"],
+                Path("/data/kitti/kitti_object/training/velodyne"),
+            )
+
+            uniform_params = dict(uniform["range_gdc"])
+            quadratic_params = dict(quadratic["range_gdc"])
+            uniform_params.pop("anchor_reliability_mode")
+            quadratic_params.pop("anchor_reliability_mode")
+            self.assertEqual(uniform_params, quadratic_params)
+
+            quadratic["args"] = make_args("quadratic")
+            commands = pipeline.build_stages(quadratic)
+            anchor_command = commands["canonical_shared_anchor"].commands_fn()[0]
+            range_command = commands["range_gdc"].commands_fn()[0]
+            self.assertIn("/data/kitti/kitti_object/training/velodyne", anchor_command)
+            self.assertNotIn("/data/kitti/kitti_object/testing/velodyne", anchor_command)
+            self.assertEqual(
+                range_command[range_command.index("--anchor_reliability_mode") + 1],
+                "quadratic",
+            )
+
+    def test_legacy_anchor_source_path_fails_fast(self):
+        cfg = {
+            "anchor": {
+                "mode": "shared_canonical", "selected_rows": [1],
+                "source_ptc_path": "/data/kitti/kitti_object/testing/velodyne",
+            },
+            "range_anchor": {"mode": "shared_canonical", "selected_rows": [1]},
+        }
+        args = type("Args", (), {
+            "config": "unused.yaml", "threads": 1, "data_tag": None,
+            "output_root": None, "kitti_root": None, "split_file": None,
+            "anchor_reliability_mode": None, "sdn_config": None,
+            "sdn_checkpoint": None, "no_distance_eval": True,
+        })()
+        with mock.patch.object(pipeline, "load_yaml", return_value=cfg):
+            with self.assertRaisesRegex(ValueError, "source_ptc_path is no longer supported"):
+                pipeline.build_context(args)
 
     def test_abs_anchor_rejection_boundary(self):
         guide = np.array([[10.0, 10.0]], dtype=np.float32)

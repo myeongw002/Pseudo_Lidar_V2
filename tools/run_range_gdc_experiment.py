@@ -409,6 +409,11 @@ def build_context(args):
     anchor_cfg = dict(cfg.get("anchor", {}))
     if anchor_cfg.get("mode", "shared_canonical") != "shared_canonical":
         raise ValueError("anchor.mode must be shared_canonical")
+    if "source_ptc_path" in anchor_cfg:
+        raise ValueError(
+            "anchor.source_ptc_path is no longer supported; "
+            "LiDAR source is derived from kitti_root/velodyne"
+        )
     anchor_rows = [int(v) for v in anchor_cfg.get("selected_rows", SELECTED_ROWS)]
     if not anchor_rows:
         raise ValueError("anchor.selected_rows must not be empty")
@@ -428,6 +433,13 @@ def build_context(args):
         raise ValueError("anchor.selected_rows and range_anchor.selected_rows must define the same canonical source rows")
 
     range_cfg = dict(cfg.get("range_gdc", {}))
+    reliability_mode = (
+        getattr(args, "anchor_reliability_mode", None)
+        or range_cfg.get("anchor_reliability_mode", "uniform")
+    )
+    if reliability_mode not in {"uniform", "quadratic"}:
+        raise ValueError("anchor_reliability_mode must be uniform or quadratic")
+    range_cfg["anchor_reliability_mode"] = reliability_mode
     projection_cfg = dict(range_cfg.get("projection", {}))
     projection = {
         "height": int(projection_cfg.get("height", projection_cfg.get("range_h", RANGE_H))),
@@ -668,7 +680,7 @@ def build_stages(ctx):
     def shared_anchor_pointcloud_commands():
         cmd = [
             sys.executable, str(REPO_ROOT / "tools" / "create_shared_canonical_anchor.py"),
-            "--velodyne-dir", str(resolve(anchor.get("source_ptc_path", p["velodyne"]))),
+            "--velodyne-dir", str(p["velodyne"]),
             "--split-file", str(p["split_file"]),
             "--output-pointcloud-dir", str(p["anchor_sparse_pc"]),
             "--output-source-index-dir", str(p["anchor_source_index"]),
@@ -849,7 +861,7 @@ def build_stages(ctx):
         Stage("sdn_depth", [p["split_file"]], [p["sdn_depth"]], [p["sdn_depth"]], sdn_commands, lambda ids: validate_depth_dir(p["sdn_depth"], ids)),
         Stage(
             "canonical_shared_anchor",
-            [resolve(anchor.get("source_ptc_path", p["velodyne"]))],
+            [p["velodyne"]],
             [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"]],
             [p["anchor_sparse_pc"], p["anchor_source_index"], p["anchor_provenance"]],
             shared_anchor_pointcloud_commands,
@@ -1123,10 +1135,15 @@ def write_run_artifacts(ctx, selected, results, dry_run):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/r64_pipeline_canonical.yaml")
+    parser.add_argument("--config", default="configs/r64_pipeline.yaml")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--kitti-root", default=None)
     parser.add_argument("--split-file", default=None)
+    parser.add_argument(
+        "--anchor-reliability-mode",
+        choices=["uniform", "quadratic"],
+        default=None,
+    )
     parser.add_argument("--data-tag", default=None)
     parser.add_argument("--sdn-config", default=None)
     parser.add_argument("--sdn-checkpoint", default=None)

@@ -210,7 +210,7 @@ def parse_args():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--split-file", required=True)
     parser.add_argument("--kitti-root", required=True)
-    parser.add_argument("--config", default="configs/r64_pipeline_canonical.yaml")
+    parser.add_argument("--config", default="configs/r64_pipeline.yaml")
     parser.add_argument("--sdn-depth-path", default=None)
     parser.add_argument("--rgc-pred-path", default=None)
     parser.add_argument("--distance-bins", default=",".join(str(v) for v in DEFAULT_BINS))
