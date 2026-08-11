@@ -782,7 +782,8 @@ def build_stages(ctx):
             "--anchor_force_policy", str(anchor_filter.get("force_policy", rgdc.get("anchor_force_policy", "accepted_only"))),
         ]
         for name in (
-            "method", "range_min", "range_max", "lambda_anchor", "lambda_prior",
+            "method", "range_min", "range_max", "anchor_reliability_mode",
+            "lambda_anchor", "lambda_prior",
             "lambda_smooth", "neighbor", "edge_spatial_mode", "sigma_angular",
             "sigma_tangent", "sigma_log_range", "max_log_range_diff", "delta_clip",
         ):

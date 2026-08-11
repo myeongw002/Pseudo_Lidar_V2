@@ -23,6 +23,7 @@ anchor_filter:
   force_policy: accepted_only
 range_gdc:
   method: cg
+  anchor_reliability_mode: uniform
   range_min: 0.1
   range_max: 80.0
   lambda_anchor: 300.0

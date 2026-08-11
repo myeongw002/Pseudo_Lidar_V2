@@ -6,6 +6,7 @@ from scipy.sparse.linalg import cg, spsolve
 
 
 ANCHOR_REJECT_MODES = {"log_ratio", "abs", "none"}
+ANCHOR_RELIABILITY_MODES = {"uniform", "quadratic"}
 NEIGHBOR_MODES = {"angular_grid4", "angular_grid8"}
 EDGE_SPATIAL_MODES = {"angular", "tangent"}
 
@@ -102,6 +103,79 @@ def _apply_anchor_reject(
     if reject.size:
         keep[coords[0][reject], coords[1][reject]] = False
     return keep, int(reject.sum())
+
+
+def compute_anchor_reliability(
+    target_mask,
+    guide_range,
+    anchor_range,
+    *,
+    anchor_reject,
+    log_ratio_thr,
+    abs_error_thr,
+    anchor_reliability_mode="uniform",
+    eps=1e-6,
+    return_debug=False,
+):
+    """Return reliability weights in accepted-target (boolean indexing) order."""
+    if anchor_reliability_mode not in ANCHOR_RELIABILITY_MODES:
+        raise ValueError(
+            "anchor_reliability_mode must be one of "
+            f"{sorted(ANCHOR_RELIABILITY_MODES)}, got {anchor_reliability_mode!r}"
+        )
+    if anchor_reject not in ANCHOR_REJECT_MODES:
+        raise ValueError(
+            f"anchor_reject must be one of {sorted(ANCHOR_REJECT_MODES)}, got {anchor_reject!r}"
+        )
+    if anchor_reliability_mode == "quadratic" and anchor_reject == "none":
+        raise ValueError(
+            "anchor_reliability_mode='quadratic' requires anchor_reject='abs' or 'log_ratio'"
+        )
+
+    target_mask = np.asarray(target_mask, dtype=bool)
+    guide_range = np.asarray(guide_range)
+    anchor_range = np.asarray(anchor_range)
+    if guide_range.shape != target_mask.shape or anchor_range.shape != target_mask.shape:
+        raise ValueError("target_mask, guide_range, and anchor_range must have matching shapes")
+
+    if anchor_reject == "log_ratio":
+        threshold = float(log_ratio_thr)
+        discrepancy = np.abs(
+            np.log(np.maximum(anchor_range[target_mask], eps))
+            - np.log(np.maximum(guide_range[target_mask], eps))
+        ).astype(np.float64, copy=False)
+    elif anchor_reject == "abs":
+        threshold = float(abs_error_thr)
+        discrepancy = np.abs(
+            anchor_range[target_mask] - guide_range[target_mask]
+        ).astype(np.float64, copy=False)
+    else:
+        threshold = np.nan
+        discrepancy = np.zeros(int(target_mask.sum()), dtype=np.float64)
+
+    if anchor_reliability_mode == "uniform":
+        normalized_discrepancy = (
+            discrepancy / threshold
+            if anchor_reject != "none" and threshold > 0.0
+            else np.zeros_like(discrepancy)
+        )
+        weights = np.ones(discrepancy.shape, dtype=np.float64)
+    else:
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("anchor rejection threshold must be positive for quadratic reliability")
+        normalized_discrepancy = discrepancy / threshold
+        weights = np.maximum(0.0, 1.0 - normalized_discrepancy ** 2)
+
+    if (
+        weights.ndim != 1
+        or not np.all(np.isfinite(weights))
+        or np.any(weights < 0.0)
+        or np.any(weights > 1.0)
+    ):
+        raise ValueError("computed anchor reliability weights must be finite and within [0, 1]")
+    if return_debug:
+        return weights, discrepancy, normalized_discrepancy
+    return weights
 
 
 def _mean_abs_and_rmse(values):
@@ -275,6 +349,7 @@ def build_graph_residual_system(
     lambda_anchor=300.0,
     lambda_prior=0.05,
     lambda_smooth=1.0,
+    target_weights=None,
 ):
     N = L.shape[0]
     if L.shape != (N, N):
@@ -288,18 +363,31 @@ def build_graph_residual_system(
 
     target_node_indices = np.asarray(target_node_indices, dtype=np.int64)
     target_delta = np.asarray(target_delta, dtype=np.float64)
+    if target_weights is None:
+        target_weights = np.ones(target_node_indices.shape, dtype=np.float64)
+    else:
+        target_weights = np.asarray(target_weights, dtype=np.float64)
+        if target_weights.ndim != 1:
+            raise ValueError("target_weights must be 1D")
+        if target_weights.shape != target_node_indices.shape:
+            raise ValueError("target_weights shape must match target_node_indices")
+        if not np.all(np.isfinite(target_weights)):
+            raise ValueError("target_weights must be finite")
+        if np.any(target_weights < 0.0) or np.any(target_weights > 1.0):
+            raise ValueError("target_weights must be within [0, 1]")
     if target_node_indices.size:
         if target_delta.shape != target_node_indices.shape:
             raise ValueError("target_delta shape must match target_node_indices")
+        effective_lambda = float(lambda_anchor) * target_weights
         anchor_diag = sparse.csr_matrix(
             (
-                np.full(target_node_indices.shape, float(lambda_anchor), dtype=np.float64),
+                effective_lambda,
                 (target_node_indices, target_node_indices),
             ),
             shape=(N, N),
         )
         A = A + anchor_diag
-        b[target_node_indices] = float(lambda_anchor) * target_delta
+        b[target_node_indices] = effective_lambda * target_delta
 
     return A.tocsr(), b
 
@@ -325,6 +413,7 @@ def _solve_graph_delta(
     lambda_anchor,
     lambda_prior,
     lambda_smooth,
+    target_weights=None,
 ):
     A, b = build_graph_residual_system(
         L,
@@ -333,6 +422,7 @@ def _solve_graph_delta(
         lambda_anchor=lambda_anchor,
         lambda_prior=lambda_prior,
         lambda_smooth=lambda_smooth,
+        target_weights=target_weights,
     )
     delta_graph, info = _solve_linear_system(A, b, method=method)
     system_residual = A @ delta_graph - b
@@ -353,6 +443,7 @@ def RangeROIGDC(
     anchor_reject="abs",
     log_ratio_thr=0.4,
     abs_error_thr=2.0,
+    anchor_reliability_mode="uniform",
     lambda_anchor=300.0,
     lambda_prior=0.1,
     lambda_smooth=1.0,
@@ -377,6 +468,15 @@ def RangeROIGDC(
         raise ValueError(f"shape mismatch: pred_range={guide_range.shape}, anchor_range={anchor_range.shape}")
     if method not in {"cg", "spsolve"}:
         raise ValueError("method must be cg or spsolve")
+    if anchor_reliability_mode not in ANCHOR_RELIABILITY_MODES:
+        raise ValueError(
+            "anchor_reliability_mode must be one of "
+            f"{sorted(ANCHOR_RELIABILITY_MODES)}, got {anchor_reliability_mode!r}"
+        )
+    if anchor_reliability_mode == "quadratic" and anchor_reject == "none":
+        raise ValueError(
+            "anchor_reliability_mode='quadratic' requires anchor_reject='abs' or 'log_ratio'"
+        )
     if delta_clip is not None and delta_clip <= 0:
         raise ValueError("delta_clip must be positive when set")
     if anchor_force_policy not in {"accepted_only", "all_valid", "none"}:
@@ -402,6 +502,7 @@ def RangeROIGDC(
         "anchor_after_reject_count": 0,
         "anchor_reject_count": 0,
         "anchor_reject_mode": anchor_reject,
+        "anchor_reliability_mode": anchor_reliability_mode,
         "anchor_force_policy": anchor_force_policy,
         "anchor_forced_count": 0,
         "anchor_reject_ratio": 0.0,
@@ -410,6 +511,20 @@ def RangeROIGDC(
         "lambda_anchor": float(lambda_anchor),
         "lambda_prior": float(lambda_prior),
         "lambda_smooth": float(lambda_smooth),
+        "anchor_reliability_mean": np.nan,
+        "anchor_reliability_std": np.nan,
+        "anchor_reliability_min": np.nan,
+        "anchor_reliability_max": np.nan,
+        "anchor_reliability_median": np.nan,
+        "anchor_reliability_p10": np.nan,
+        "anchor_reliability_p90": np.nan,
+        "anchor_reliability_lt_025_ratio": 0.0,
+        "anchor_reliability_025_050_ratio": 0.0,
+        "anchor_reliability_050_075_ratio": 0.0,
+        "anchor_reliability_ge_075_ratio": 0.0,
+        "effective_anchor_lambda_mean": np.nan,
+        "effective_anchor_lambda_min": np.nan,
+        "effective_anchor_lambda_max": np.nan,
         "delta_clip": "" if delta_clip is None else float(delta_clip),
         "delta_graph_mean": np.nan,
         "delta_graph_std": np.nan,
@@ -490,6 +605,12 @@ def RangeROIGDC(
         stats["t_total_correction"] = time.perf_counter() - t0
         result = (corrected_range, output_mask, stats)
         if return_debug:
+            debug = {
+                "target_weights": np.empty((0,), dtype=np.float64),
+                "target_discrepancy": np.empty((0,), dtype=np.float64),
+                "target_normalized_discrepancy": np.empty((0,), dtype=np.float64),
+                "target_mask": target_mask,
+            }
             result = (*result, debug)
         return result if return_stats else (corrected_range, output_mask)
 
@@ -501,6 +622,41 @@ def RangeROIGDC(
     target_delta = target_delta_map[target_mask]
     if delta_clip is not None:
         target_delta = np.clip(target_delta, -float(delta_clip), float(delta_clip))
+    target_weights, anchor_discrepancy, anchor_normalized_discrepancy = (
+        compute_anchor_reliability(
+            target_mask,
+            guide_range,
+            anchor_range,
+            anchor_reject=anchor_reject,
+            log_ratio_thr=log_ratio_thr,
+            abs_error_thr=abs_error_thr,
+            anchor_reliability_mode=anchor_reliability_mode,
+            return_debug=True,
+        )
+    )
+    if target_weights.size:
+        stats.update(
+            {
+                "anchor_reliability_mean": float(np.mean(target_weights)),
+                "anchor_reliability_std": float(np.std(target_weights)),
+                "anchor_reliability_min": float(np.min(target_weights)),
+                "anchor_reliability_max": float(np.max(target_weights)),
+                "anchor_reliability_median": float(np.median(target_weights)),
+                "anchor_reliability_p10": float(np.percentile(target_weights, 10)),
+                "anchor_reliability_p90": float(np.percentile(target_weights, 90)),
+                "anchor_reliability_lt_025_ratio": float(np.mean(target_weights < 0.25)),
+                "anchor_reliability_025_050_ratio": float(
+                    np.mean((target_weights >= 0.25) & (target_weights < 0.5))
+                ),
+                "anchor_reliability_050_075_ratio": float(
+                    np.mean((target_weights >= 0.5) & (target_weights < 0.75))
+                ),
+                "anchor_reliability_ge_075_ratio": float(np.mean(target_weights >= 0.75)),
+                "effective_anchor_lambda_mean": float(lambda_anchor * np.mean(target_weights)),
+                "effective_anchor_lambda_min": float(lambda_anchor * np.min(target_weights)),
+                "effective_anchor_lambda_max": float(lambda_anchor * np.max(target_weights)),
+            }
+        )
 
     stats.update(_vector_stats(target_delta, "residual_target"))
     before_reject_err = guide_range[target_before_reject] - anchor_range[target_before_reject]
@@ -526,6 +682,7 @@ def RangeROIGDC(
         L, target_node_indices, target_delta, method=method,
         lambda_anchor=lambda_anchor, lambda_prior=lambda_prior,
         lambda_smooth=lambda_smooth,
+        target_weights=target_weights,
     )
     if delta_clip is not None:
         delta_graph = np.clip(delta_graph, -float(delta_clip), float(delta_clip))
@@ -610,8 +767,12 @@ def RangeROIGDC(
             "delta_final": delta_final,
             "target_node_indices": target_node_indices,
             "target_delta": target_delta,
+            "target_weights": target_weights,
+            "target_discrepancy": anchor_discrepancy,
+            "target_normalized_discrepancy": anchor_normalized_discrepancy,
             "guide_valid": guide_valid,
             "target_mask": target_mask,
+            "force_mask": force_mask,
             **graph_debug,
         }
 

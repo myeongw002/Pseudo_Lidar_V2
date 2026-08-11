@@ -4,11 +4,17 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+from scipy import sparse
 
 from range_gdc.evaluate_range_metrics import leakage_row
 from range_gdc.build_range_anchor import process_one
 from range_gdc import range_main_batch as range_batch
-from range_gdc.range_gdc import RangeROIGDC, _apply_anchor_reject
+from range_gdc.range_gdc import (
+    RangeROIGDC,
+    _apply_anchor_reject,
+    build_graph_residual_system,
+    compute_anchor_reliability,
+)
 from range_gdc.range_main_batch import npy_map, select_scene_ids
 from range_gdc.range_projection import range_to_velo
 from src.pseudo_lidar.depth_to_range_uniform import lidar_points_to_spherical_guide_uniform
@@ -312,7 +318,10 @@ class PaperPipelineTests(unittest.TestCase):
                 "split_file": str(split), "data_tag": "unit",
                 "range_anchor": {"mode": "shared_canonical", "selected_rows": [1]},
                 "anchor": {"mode": "shared_canonical", "selected_rows": [1]},
-                "range_gdc": {"lambda_anchor": 123.0},
+                "range_gdc": {
+                    "lambda_anchor": 123.0,
+                    "anchor_reliability_mode": "quadratic",
+                },
             }
             args = type("Args", (), {"config": str(root / "config.yaml"), "threads": 1, "data_tag": None, "output_root": None,
                 "kitti_root": None, "split_file": None, "sdn_config": None, "sdn_checkpoint": None,
@@ -325,6 +334,9 @@ class PaperPipelineTests(unittest.TestCase):
             commands = pipeline.build_stages(context)["range_gdc"].commands_fn()[0]
             self.assertIn("--lambda_anchor", commands)
             self.assertEqual(commands[commands.index("--lambda_anchor") + 1], "123.0")
+            self.assertEqual(
+                commands[commands.index("--anchor_reliability_mode") + 1], "quadratic"
+            )
             self.assertNotIn("--selection_mode", commands)
             self.assertNotIn("--ablation_mode", commands)
 
@@ -352,8 +364,22 @@ class PaperPipelineTests(unittest.TestCase):
         range_cfg = config["range_gdc"]
         self.assertEqual(range_cfg["neighbor"], "angular_grid8")
         self.assertEqual(range_cfg["lambda_anchor"], 300.0)
+        self.assertEqual(range_cfg["anchor_reliability_mode"], "uniform")
         for name in ("selection_mode", "confidence_mode", "transfer_k", "ablation_mode"):
             self.assertNotIn(name, range_cfg)
+
+    def test_anchor_reliability_train1000_config_is_quadratic_only_variant(self):
+        root = Path(__file__).parents[1]
+        canonical = pipeline.load_yaml(
+            str(root / "configs" / "r64_pipeline_canonical_train1000.yaml")
+        )
+        experimental = pipeline.load_yaml(
+            str(root / "configs" / "r64_pipeline_anchor_reliability_train1000.yaml")
+        )
+        self.assertNotEqual(canonical["output_root"], experimental["output_root"])
+        canonical["output_root"] = experimental["output_root"]
+        canonical["range_gdc"]["anchor_reliability_mode"] = "quadratic"
+        self.assertEqual(canonical, experimental)
 
     def test_abs_anchor_rejection_boundary(self):
         guide = np.array([[10.0, 10.0]], dtype=np.float32)
@@ -384,6 +410,122 @@ class PaperPipelineTests(unittest.TestCase):
         self.assertEqual(debug["L"].shape, (guide.size, guide.size))
         self.assertEqual(stats["anchor_forced_count"], 1)
         self.assertEqual(corrected[1, 2], anchor[1, 2])
+
+    def test_uniform_target_weights_preserve_graph_system_exactly(self):
+        L = sparse.csr_matrix(
+            np.array([[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]])
+        )
+        targets = np.array([0, 2])
+        delta = np.array([0.25, -0.1])
+        baseline_A, baseline_b = build_graph_residual_system(
+            L, targets, delta, lambda_anchor=300.0, lambda_prior=0.1
+        )
+        uniform_A, uniform_b = build_graph_residual_system(
+            L, targets, delta, lambda_anchor=300.0, lambda_prior=0.1,
+            target_weights=np.ones(2),
+        )
+        self.assertTrue(np.array_equal(baseline_A.toarray(), uniform_A.toarray()))
+        self.assertTrue(np.array_equal(baseline_b, uniform_b))
+
+    def test_default_and_explicit_uniform_are_exactly_equivalent(self):
+        guide = np.full((4, 5), 10.0, dtype=np.float32)
+        anchor = np.zeros_like(guide)
+        anchor[0, 0], anchor[1, 1], anchor[2, 3], anchor[3, 4] = 10.0, 10.5, 11.0, 11.5
+        baseline = RangeROIGDC(
+            guide, anchor, method="spsolve", return_stats=True, return_debug=True,
+        )
+        uniform = RangeROIGDC(
+            guide, anchor, method="spsolve", anchor_reliability_mode="uniform",
+            return_stats=True, return_debug=True,
+        )
+        self.assertTrue(np.array_equal(baseline[0], uniform[0]))
+        self.assertTrue(np.array_equal(baseline[1], uniform[1]))
+        self.assertTrue(np.array_equal(baseline[3]["A"].toarray(), uniform[3]["A"].toarray()))
+        self.assertTrue(np.array_equal(baseline[3]["b"], uniform[3]["b"]))
+        self.assertTrue(np.array_equal(uniform[3]["target_weights"], np.ones(4)))
+
+    def test_quadratic_anchor_reliability_formula_and_rejection_boundary(self):
+        guide = np.full((1, 5), 10.0, dtype=np.float64)
+        anchor = guide + np.array([[0.0, 0.5, 1.0, 1.5, 2.0]])
+        accepted, rejected = _apply_anchor_reject(
+            np.ones_like(guide, dtype=bool), guide, anchor, "abs", 0.4, 2.0,
+        )
+        weights = compute_anchor_reliability(
+            accepted, guide, anchor, anchor_reject="abs", log_ratio_thr=0.4,
+            abs_error_thr=2.0, anchor_reliability_mode="quadratic",
+        )
+        self.assertEqual(rejected, 1)
+        np.testing.assert_allclose(weights, [1.0, 0.9375, 0.75, 0.4375], rtol=0, atol=0)
+
+    def test_weighted_anchor_constraint_uses_effective_lambda(self):
+        L = sparse.csr_matrix((2, 2), dtype=np.float64)
+        weighted_A, weighted_b = build_graph_residual_system(
+            L, np.array([1]), np.array([0.25]), lambda_anchor=300.0,
+            lambda_prior=0.1, target_weights=np.array([0.5]),
+        )
+        uniform_A, uniform_b = build_graph_residual_system(
+            L, np.array([1]), np.array([0.25]), lambda_anchor=300.0,
+            lambda_prior=0.1, target_weights=np.array([1.0]),
+        )
+        self.assertEqual(weighted_A[1, 1], 150.1)
+        self.assertEqual(weighted_b[1], 37.5)
+        self.assertEqual(uniform_A[1, 1], 300.1)
+        self.assertEqual(uniform_b[1], 75.0)
+
+    def test_quadratic_reliability_keeps_accepted_anchor_force_exact(self):
+        guide = np.full((2, 3), 10.0, dtype=np.float32)
+        anchor = np.zeros_like(guide)
+        anchor[0, 0] = 11.5
+        corrected, _, stats, debug = RangeROIGDC(
+            guide, anchor, method="spsolve", anchor_reject="abs", abs_error_thr=2.0,
+            anchor_reliability_mode="quadratic", anchor_force_policy="accepted_only",
+            return_stats=True, return_debug=True,
+        )
+        self.assertLess(debug["target_weights"][0], 1.0)
+        self.assertIn("target_discrepancy", debug)
+        self.assertIn("target_normalized_discrepancy", debug)
+        self.assertEqual(stats["anchor_reliability_mode"], "quadratic")
+        self.assertEqual(stats["effective_anchor_lambda_min"], 131.25)
+        self.assertEqual(corrected[0, 0], anchor[0, 0])
+        self.assertEqual(stats["anchor_forced_count"], 1)
+
+    def test_quadratic_changes_only_non_anchor_propagation_strength(self):
+        guide = np.full((2, 3), 10.0, dtype=np.float32)
+        anchor = np.zeros_like(guide)
+        anchor[0, 0] = 11.5
+        common = dict(
+            method="spsolve", anchor_reject="abs", abs_error_thr=2.0,
+            lambda_anchor=3.0, sigma_angular=10.0, anchor_force_policy="accepted_only",
+            return_stats=True, return_debug=True,
+        )
+        uniform = RangeROIGDC(guide, anchor, anchor_reliability_mode="uniform", **common)
+        quadratic = RangeROIGDC(guide, anchor, anchor_reliability_mode="quadratic", **common)
+        self.assertTrue(np.array_equal(uniform[1], quadratic[1]))
+        self.assertTrue(np.array_equal(uniform[3]["target_mask"], quadratic[3]["target_mask"]))
+        self.assertTrue(np.array_equal(uniform[3]["force_mask"], quadratic[3]["force_mask"]))
+        non_anchor = ~uniform[3]["target_mask"]
+        self.assertGreater(
+            float(np.max(np.abs(uniform[0][non_anchor] - quadratic[0][non_anchor]))), 0.0
+        )
+
+    def test_invalid_anchor_reliability_inputs_raise(self):
+        guide = np.array([[10.0]], dtype=np.float32)
+        anchor = np.array([[10.5]], dtype=np.float32)
+        with self.assertRaisesRegex(ValueError, "requires anchor_reject"):
+            RangeROIGDC(
+                guide, anchor, anchor_reject="none", anchor_reliability_mode="quadratic"
+            )
+        L = sparse.csr_matrix((2, 2), dtype=np.float64)
+        invalid_weights = (
+            np.array([-0.1]), np.array([1.1]), np.array([np.nan]),
+            np.array([[0.5]]), np.array([0.5, 0.5]),
+        )
+        for weights in invalid_weights:
+            with self.subTest(weights=weights):
+                with self.assertRaises(ValueError):
+                    build_graph_residual_system(
+                        L, np.array([1]), np.array([0.25]), target_weights=weights,
+                    )
 
     def test_spherical_projection_round_trip(self):
         points = np.array([[10.0, 0.0, 0.0], [8.0, 2.0, -1.0]], dtype=np.float32)
@@ -419,6 +561,7 @@ class PaperPipelineTests(unittest.TestCase):
             "anchor_reject": "none",
             "log_ratio_thr": 0.4,
             "abs_error_thr": 2.0,
+            "anchor_reliability_mode": "uniform",
             "lambda_anchor": 300.0,
             "lambda_prior": 0.1,
             "lambda_smooth": 1.0,
