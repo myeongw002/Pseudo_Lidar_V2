@@ -8,6 +8,7 @@ from scipy.sparse.linalg import cg, spsolve
 ANCHOR_REJECT_MODES = {"log_ratio", "abs", "none"}
 NEIGHBOR_MODES = {"angular_grid4", "angular_grid8"}
 EDGE_SPATIAL_MODES = {"angular", "tangent"}
+EDGE_RANGE_MODES = {"log_gaussian", "uniform"}
 
 
 def valid_range_mask(range_img, range_min=0.1, range_max=80.0):
@@ -144,12 +145,18 @@ def build_spherical_graph_laplacian(
     sigma_tangent=1.0,
     sigma_log_range=0.3,
     max_log_range_diff=None,
+    edge_range_mode="log_gaussian",
 ):
     if neighbor not in NEIGHBOR_MODES:
         raise ValueError(f"neighbor must be one of {sorted(NEIGHBOR_MODES)}, got {neighbor!r}")
     if edge_spatial_mode not in EDGE_SPATIAL_MODES:
         raise ValueError(
             f"edge_spatial_mode must be one of {sorted(EDGE_SPATIAL_MODES)}, got {edge_spatial_mode!r}"
+        )
+    if edge_range_mode not in EDGE_RANGE_MODES:
+        raise ValueError(
+            f"edge_range_mode must be one of {sorted(EDGE_RANGE_MODES)}, "
+            f"got {edge_range_mode!r}"
         )
     if sigma_angular <= 0:
         raise ValueError("sigma_angular must be positive")
@@ -214,7 +221,15 @@ def build_spherical_graph_laplacian(
 
             log_diff = abs(float(np.log(ri) - np.log(rj)))
             spatial_weight = float(np.exp(-d_spatial_sq / (2.0 * spatial_sigma ** 2)))
-            range_gate = float(np.exp(-(log_diff ** 2) / (2.0 * float(sigma_log_range) ** 2)))
+            if edge_range_mode == "log_gaussian":
+                range_gate = float(
+                    np.exp(
+                        -(log_diff ** 2)
+                        / (2.0 * float(sigma_log_range) ** 2)
+                    )
+                )
+            else:
+                range_gate = 1.0
             weight = spatial_weight * range_gate
             if max_log_range_diff is not None and log_diff > float(max_log_range_diff):
                 weight = 0.0
@@ -239,6 +254,7 @@ def build_spherical_graph_laplacian(
     stats = {
         "neighbor": neighbor,
         "edge_spatial_mode": edge_spatial_mode,
+        "edge_range_mode": edge_range_mode,
         "sigma_angular": float(sigma_angular),
         "sigma_tangent": float(sigma_tangent),
         "sigma_log_range": float(sigma_log_range),
@@ -362,6 +378,7 @@ def RangeROIGDC(
     sigma_tangent=1.0,
     sigma_log_range=0.3,
     max_log_range_diff=None,
+    edge_range_mode="log_gaussian",
     delta_clip=0.3,
     anchor_force_policy="accepted_only",
     return_debug=False,
@@ -377,6 +394,11 @@ def RangeROIGDC(
         raise ValueError(f"shape mismatch: pred_range={guide_range.shape}, anchor_range={anchor_range.shape}")
     if method not in {"cg", "spsolve"}:
         raise ValueError("method must be cg or spsolve")
+    if edge_range_mode not in EDGE_RANGE_MODES:
+        raise ValueError(
+            f"edge_range_mode must be one of {sorted(EDGE_RANGE_MODES)}, "
+            f"got {edge_range_mode!r}"
+        )
     if delta_clip is not None and delta_clip <= 0:
         raise ValueError("delta_clip must be positive when set")
     if anchor_force_policy not in {"accepted_only", "all_valid", "none"}:
@@ -410,6 +432,7 @@ def RangeROIGDC(
         "lambda_anchor": float(lambda_anchor),
         "lambda_prior": float(lambda_prior),
         "lambda_smooth": float(lambda_smooth),
+        "edge_range_mode": edge_range_mode,
         "delta_clip": "" if delta_clip is None else float(delta_clip),
         "delta_graph_mean": np.nan,
         "delta_graph_std": np.nan,
@@ -521,6 +544,7 @@ def RangeROIGDC(
         neighbor=neighbor, edge_spatial_mode=edge_spatial_mode,
         sigma_angular=sigma_angular, sigma_tangent=sigma_tangent,
         sigma_log_range=sigma_log_range, max_log_range_diff=max_log_range_diff,
+        edge_range_mode=edge_range_mode,
     )
     stats["t_build_graph"] = time.perf_counter() - t_graph0
     stats.update(graph_stats)

@@ -550,6 +550,7 @@ class PaperPipelineTests(unittest.TestCase):
             "lambda_smooth": 1.0,
             "neighbor": "angular_grid8",
             "edge_spatial_mode": "angular",
+            "edge_range_mode": "log_gaussian",
             "sigma_angular": 0.01,
             "sigma_tangent": 1.0,
             "sigma_log_range": 0.3,

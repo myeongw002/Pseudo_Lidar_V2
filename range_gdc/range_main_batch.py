@@ -49,6 +49,7 @@ STATS_FIELDNAMES = [
     "delta_final_abs_mean",
     "neighbor",
     "edge_spatial_mode",
+    "edge_range_mode",
     "sigma_angular",
     "sigma_tangent",
     "sigma_log_range",
@@ -272,6 +273,7 @@ def process_one(task):
         sigma_tangent=args_dict["sigma_tangent"],
         sigma_log_range=args_dict["sigma_log_range"],
         max_log_range_diff=args_dict["max_log_range_diff"],
+        edge_range_mode=args_dict["edge_range_mode"],
         delta_clip=args_dict["delta_clip"],
         anchor_force_policy=args_dict["anchor_force_policy"],
         return_stats=True,
@@ -300,7 +302,7 @@ def write_stats_csv(path, stats_rows):
             writer.writerow(row)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run graph-only Range-GDC.")
     parser.add_argument("--pred_path", "--guide_path", dest="pred_path", required=True)
     parser.add_argument("--anchor_path", required=True)
@@ -326,6 +328,11 @@ def parse_args():
     parser.add_argument("--lambda_smooth", type=float, default=1.0)
     parser.add_argument("--neighbor", choices=["angular_grid4", "angular_grid8"], default="angular_grid8")
     parser.add_argument("--edge_spatial_mode", choices=["angular", "tangent"], default="angular")
+    parser.add_argument(
+        "--edge_range_mode",
+        choices=["log_gaussian", "uniform"],
+        default="log_gaussian",
+    )
     parser.add_argument("--sigma_angular", type=float, default=0.01)
     parser.add_argument("--sigma_tangent", type=float, default=1.0)
     parser.add_argument("--sigma_log_range", type=float, default=0.3)
@@ -340,7 +347,7 @@ def parse_args():
     parser.add_argument("--max_items", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_args(args):
@@ -418,6 +425,7 @@ def main():
     print(f"method            : {args.method}")
     print(f"neighbor          : {args.neighbor}")
     print(f"edge_spatial_mode : {args.edge_spatial_mode}")
+    print(f"edge_range_mode   : {args.edge_range_mode}")
     print(f"threads           : {args.threads}")
 
     stats_rows = []
