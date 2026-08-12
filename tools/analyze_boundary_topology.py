@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline paper diagnostic for range-boundary error and RGC graph topology.
+"""Offline paper diagnostic for boundary error, correction activity, and topology.
 
 This tool reads existing correction artifacts. It never runs SDN, Original GDC,
 or Range-GDC correction. RGC graph construction is reconstructed with the
@@ -11,6 +11,10 @@ magnitudes, not directly equivalent edge-weight probabilities. Exact Original
 GDC graph mapping is intentionally reported as unsupported unless an exact
 camera-node to canonical-range-cell correspondence is available; this tool does
 not invent an approximate correspondence.
+
+Correction ``harm_rate`` is harmed/all evaluated pixels; ``changed_harm_rate``
+is changed-and-harmed/changed pixels. Activity and GT-error outcome are separate
+classifications.
 """
 
 import argparse
@@ -39,10 +43,10 @@ from range_gdc.range_gdc import (  # noqa: E402
 from range_gdc.range_main_batch import npy_map, read_split_scene_ids  # noqa: E402
 
 
-METHODS = ("raw_sdn", "original_gdc", "range_gdc")
 REGIONS = ("boundary", "interior")
 DISTANCE_BINS = ("0", "1", "2", "3", "4+")
 HARM_TOL = 1e-6
+DEFAULT_CORRECTION_TOL = 1e-3
 GDC_UNSUPPORTED_STATUS = "unsupported_insufficient_exact_mapping"
 
 
@@ -178,6 +182,130 @@ def _safe_mean(values):
 def _safe_median(values):
     values = np.asarray(values, dtype=np.float64)
     return float(np.median(values)) if values.size else math.nan
+
+
+def _correction_activity_from_vectors(signed_correction, error_delta,
+                                      correction_tol=DEFAULT_CORRECTION_TOL,
+                                      error_tol=HARM_TOL):
+    """Summarize correction activity and GT-error outcomes on one domain.
+
+    Activity is independent of outcome: ``changed`` uses correction magnitude,
+    while improved/harmed/neutral use the change in absolute GT error.
+    """
+    if not np.isfinite(correction_tol) or correction_tol < 0:
+        raise ValueError("correction_tol must be finite and nonnegative")
+    if not np.isfinite(error_tol) or error_tol < 0:
+        raise ValueError("error_tol must be finite and nonnegative")
+    signed = np.asarray(signed_correction, dtype=np.float64).reshape(-1)
+    delta = np.asarray(error_delta, dtype=np.float64).reshape(-1)
+    if signed.shape != delta.shape:
+        raise ValueError("signed_correction and error_delta must have the same shape")
+    if not np.all(np.isfinite(signed)) or not np.all(np.isfinite(delta)):
+        raise ValueError("activity vectors must be finite")
+
+    absolute = np.abs(signed)
+    changed = absolute > float(correction_tol)
+    improved = delta < -float(error_tol)
+    harmed = delta > float(error_tol)
+    neutral = ~(improved | harmed)
+    unchanged = ~changed
+    changed_improved = changed & improved
+    changed_harmed = changed & harmed
+    changed_neutral = changed & neutral
+
+    pixels = int(delta.size)
+    changed_pixels = int(changed.sum())
+    unchanged_pixels = int(unchanged.sum())
+    improved_pixels = int(improved.sum())
+    harmed_pixels = int(harmed.sum())
+    neutral_pixels = int(neutral.sum())
+    changed_improved_pixels = int(changed_improved.sum())
+    changed_harmed_pixels = int(changed_harmed.sum())
+    changed_neutral_pixels = int(changed_neutral.sum())
+    if changed_pixels + unchanged_pixels != pixels:
+        raise RuntimeError("changed/unchanged activity identity failed")
+    if improved_pixels + harmed_pixels + neutral_pixels != pixels:
+        raise RuntimeError("improved/harmed/neutral activity identity failed")
+    if (
+        changed_improved_pixels
+        + changed_harmed_pixels
+        + changed_neutral_pixels
+        != changed_pixels
+    ):
+        raise RuntimeError("changed outcome activity identity failed")
+
+    positive_improvement = np.maximum(-delta, 0.0)
+    positive_harm = np.maximum(delta, 0.0)
+    total_improvement = float(np.sum(positive_improvement))
+    total_harm = float(np.sum(positive_harm))
+    net_error_reduction = total_improvement - total_harm
+    if total_harm > 0.0:
+        improvement_to_harm_ratio = total_improvement / total_harm
+    elif total_improvement > 0.0:
+        improvement_to_harm_ratio = math.inf
+    else:
+        improvement_to_harm_ratio = math.nan
+    changed_absolute = absolute[changed]
+    return {
+        "pixels": pixels,
+        "changed_pixels": changed_pixels,
+        "unchanged_pixels": unchanged_pixels,
+        "changed_ratio": _safe_ratio(changed_pixels, pixels),
+        "unchanged_ratio": _safe_ratio(unchanged_pixels, pixels),
+        "improved_pixels": improved_pixels,
+        "harmed_pixels": harmed_pixels,
+        "neutral_pixels": neutral_pixels,
+        "improved_ratio": _safe_ratio(improved_pixels, pixels),
+        "harm_rate": _safe_ratio(harmed_pixels, pixels),
+        "neutral_ratio": _safe_ratio(neutral_pixels, pixels),
+        "changed_improved_pixels": changed_improved_pixels,
+        "changed_harmed_pixels": changed_harmed_pixels,
+        "changed_neutral_pixels": changed_neutral_pixels,
+        "changed_improvement_rate": _safe_ratio(
+            changed_improved_pixels, changed_pixels
+        ),
+        "changed_harm_rate": _safe_ratio(changed_harmed_pixels, changed_pixels),
+        "changed_neutral_rate": _safe_ratio(
+            changed_neutral_pixels, changed_pixels
+        ),
+        "mean_abs_correction": _safe_mean(absolute),
+        "median_abs_correction": _safe_median(absolute),
+        "p90_abs_correction": (
+            float(np.percentile(absolute, 90)) if pixels else math.nan
+        ),
+        "p95_abs_correction": (
+            float(np.percentile(absolute, 95)) if pixels else math.nan
+        ),
+        "mean_abs_correction_changed_only": _safe_mean(changed_absolute),
+        "median_abs_correction_changed_only": _safe_median(changed_absolute),
+        "total_improvement": total_improvement,
+        "total_harm": total_harm,
+        "net_error_reduction": net_error_reduction,
+        "mean_net_error_reduction": _safe_ratio(net_error_reduction, pixels),
+        "improvement_to_harm_ratio": improvement_to_harm_ratio,
+        "mean_signed_correction": _safe_mean(signed),
+        "median_signed_correction": _safe_median(signed),
+    }
+
+
+def correction_activity_metrics(prediction, gt, raw, mask,
+                                correction_tol=DEFAULT_CORRECTION_TOL,
+                                error_tol=HARM_TOL):
+    prediction = np.asarray(prediction, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+    raw = np.asarray(raw, dtype=np.float64)
+    mask = np.asarray(mask, dtype=bool)
+    if prediction.shape != gt.shape or raw.shape != gt.shape or mask.shape != gt.shape:
+        raise ValueError("prediction, GT, raw, and mask must share a shape")
+    signed = prediction[mask] - raw[mask]
+    error_delta = (
+        np.abs(prediction[mask] - gt[mask])
+        - np.abs(raw[mask] - gt[mask])
+    )
+    metrics = _correction_activity_from_vectors(
+        signed, error_delta, correction_tol, error_tol
+    )
+    return metrics, {"signed_correction": signed, "error_delta": error_delta}
 
 
 def rgc_graph_quality_rows(raw_range, gt_range, projection, args):
@@ -320,6 +448,47 @@ def aggregate_distance_rows(accumulators, frame_count):
             "median_abs": metrics["median_abs"],
             "p90_abs": metrics["p90_abs"],
         })
+    return output
+
+
+def aggregate_activity_rows(accumulators, frame_count, correction_tol,
+                            distance_profile=False):
+    output = []
+    distance_order = {label: index for index, label in enumerate(DISTANCE_BINS)}
+    items = accumulators.items()
+    if distance_profile:
+        items = sorted(
+            items, key=lambda value: (value[0][0], distance_order[value[0][1]])
+        )
+    else:
+        items = sorted(items)
+    for (method, region), item in items:
+        signed = (
+            np.concatenate(item["signed_correction"])
+            if item["signed_correction"] else np.array([], dtype=np.float64)
+        )
+        error_delta = (
+            np.concatenate(item["error_delta"])
+            if item["error_delta"] else np.array([], dtype=np.float64)
+        )
+        metrics = _correction_activity_from_vectors(
+            signed, error_delta, correction_tol, HARM_TOL
+        )
+        if distance_profile:
+            row = {
+                "method": method,
+                "boundary_distance_bin": region,
+                "frames": frame_count,
+                **metrics,
+            }
+        else:
+            row = {
+                "method": method,
+                "region": region,
+                "frames": frame_count,
+                **metrics,
+            }
+        output.append(row)
     return output
 
 
@@ -479,6 +648,11 @@ def _git_commit():
 
 
 def analyze(args):
+    method_specs = (
+        ("raw_sdn", "raw_sdn"),
+        (args.gdc_label, "original_gdc"),
+        ("range_gdc", "range_gdc"),
+    )
     projection = resolve_projection_meta(args)
     source_rows = args.source_rows or projection["selected_rows"] or [5, 7, 9, 11]
     source_rows = [int(value) for value in source_rows]
@@ -493,6 +667,13 @@ def analyze(args):
     graph_rows = []
     boundary_acc = defaultdict(lambda: {"errors": [], "delta": []})
     distance_acc = defaultdict(list)
+    activity_rows = []
+    activity_acc = defaultdict(
+        lambda: {"signed_correction": [], "error_delta": []}
+    )
+    activity_distance_acc = defaultdict(
+        lambda: {"signed_correction": [], "error_delta": []}
+    )
     warnings = []
     boundary_pixels = 0
     common_pixels = 0
@@ -510,7 +691,7 @@ def analyze(args):
         if np.any(valid_range_mask(anchor_outside, args.range_min, args.range_max)):
             raise ValueError(f"{scene_id}: canonical anchor contains values outside source rows")
 
-        predictions = [arrays[name] for name in METHODS]
+        predictions = [arrays[array_name] for _, array_name in method_specs]
         common = common_hidden_valid_mask(
             arrays["gt"], predictions, source_rows, args.range_min, args.range_max
         )
@@ -522,8 +703,8 @@ def analyze(args):
         boundary_pixels += int(boundary_region.sum())
         common_pixels += int(common.sum())
 
-        for method in METHODS:
-            prediction = arrays[method]
+        for method, array_name in method_specs:
+            prediction = arrays[array_name]
             for region in REGIONS:
                 mask = region_mask(common, distance, region, args.boundary_radius)
                 metrics, accum = comparison_metrics(
@@ -536,6 +717,29 @@ def analyze(args):
                     boundary_acc[(method, region)]["delta"].append(accum["delta"])
                 else:
                     boundary_acc[(method, region)]
+                activity_metrics, activity_vectors = correction_activity_metrics(
+                    prediction,
+                    arrays["gt"],
+                    arrays["raw_sdn"],
+                    mask,
+                    args.correction_tol,
+                    HARM_TOL,
+                )
+                activity_rows.append({
+                    "frame_id": scene_id,
+                    "method": method,
+                    "region": region,
+                    **activity_metrics,
+                })
+                if activity_vectors["signed_correction"].size:
+                    activity_acc[(method, region)]["signed_correction"].append(
+                        activity_vectors["signed_correction"]
+                    )
+                    activity_acc[(method, region)]["error_delta"].append(
+                        activity_vectors["error_delta"]
+                    )
+                else:
+                    activity_acc[(method, region)]
             for label in DISTANCE_BINS:
                 mask = boundary_distance_bin_mask(common, distance, label)
                 errors = prediction[mask].astype(np.float64) - arrays["gt"][mask]
@@ -550,6 +754,23 @@ def analyze(args):
                     distance_acc[(method, label)].append(errors)
                 else:
                     distance_acc[(method, label)]
+                _, activity_vectors = correction_activity_metrics(
+                    prediction,
+                    arrays["gt"],
+                    arrays["raw_sdn"],
+                    mask,
+                    args.correction_tol,
+                    HARM_TOL,
+                )
+                if activity_vectors["signed_correction"].size:
+                    activity_distance_acc[(method, label)][
+                        "signed_correction"
+                    ].append(activity_vectors["signed_correction"])
+                    activity_distance_acc[(method, label)]["error_delta"].append(
+                        activity_vectors["error_delta"]
+                    )
+                else:
+                    activity_distance_acc[(method, label)]
 
         rgc_rows, debug = rgc_graph_quality_rows(arrays["raw_sdn"], arrays["gt"], projection, args)
         node_rows, node_cols = np.where(valid_range_mask(arrays["raw_sdn"], args.range_min, args.range_max))
@@ -567,6 +788,15 @@ def analyze(args):
     boundary_summary = aggregate_boundary_rows(boundary_acc, len(scene_ids))
     distance_summary = aggregate_distance_rows(distance_acc, len(scene_ids))
     graph_summary = aggregate_graph_rows(graph_rows, len(scene_ids))
+    activity_summary = aggregate_activity_rows(
+        activity_acc, len(scene_ids), args.correction_tol
+    )
+    activity_distance_summary = aggregate_activity_rows(
+        activity_distance_acc,
+        len(scene_ids),
+        args.correction_tol,
+        distance_profile=True,
+    )
     boundary_fraction = _safe_ratio(boundary_pixels, common_pixels)
     if np.isfinite(boundary_fraction) and (boundary_fraction < 0.01 or boundary_fraction > 0.50):
         warnings.append(
@@ -592,6 +822,12 @@ def analyze(args):
     write_csv(output_dir / "boundary_distance_summary.csv", distance_summary)
     write_csv(output_dir / "graph_edge_per_frame.csv", graph_rows)
     write_csv(output_dir / "graph_edge_summary.csv", graph_summary)
+    write_csv(output_dir / "correction_activity_per_frame.csv", activity_rows)
+    write_csv(output_dir / "correction_activity_summary.csv", activity_summary)
+    write_csv(
+        output_dir / "correction_activity_distance_summary.csv",
+        activity_distance_summary,
+    )
 
     metadata = {
         "analysis_kind": "offline_topology_diagnostic_not_a_correction_method",
@@ -608,6 +844,18 @@ def analyze(args):
         "common_hidden_valid_pixels": common_pixels,
         "boundary_pixel_fraction": boundary_fraction,
         "harm_tolerance": HARM_TOL,
+        "correction_tolerance": args.correction_tol,
+        "error_tolerance": HARM_TOL,
+        "gdc_label": args.gdc_label,
+        "activity_semantics": {
+            "changed": "abs(method_range - raw_range) > correction_tolerance",
+            "unchanged": "abs(method_range - raw_range) <= correction_tolerance",
+            "outcome": "improved/harmed compare absolute GT error using error_tolerance; neutral is the complement",
+            "harm_rate": "harmed pixels / all evaluated pixels",
+            "changed_harm_rate": "changed-and-harmed pixels / changed pixels",
+            "empty_changed_statistics": "changed-only statistics and conditional rates are NaN",
+            "improvement_to_harm_ratio": "inf when only improvement is positive; NaN when both totals are zero",
+        },
         "rgc_graph_parameters": {
             "neighbor": args.neighbor,
             "edge_spatial_mode": args.edge_spatial_mode,
@@ -635,6 +883,8 @@ def analyze(args):
         "boundary_summary": boundary_summary,
         "distance_summary": distance_summary,
         "graph_summary": graph_summary,
+        "activity_summary": activity_summary,
+        "activity_distance_summary": activity_distance_summary,
         "metadata": metadata,
     }
 
@@ -645,6 +895,7 @@ def parse_args():
     parser.add_argument("--gt-range-dir", required=True)
     parser.add_argument("--rgc-range-dir", required=True)
     parser.add_argument("--gdc-range-dir", required=True)
+    parser.add_argument("--gdc-label", default="original_gdc")
     parser.add_argument("--anchor-range-dir", required=True)
     meta = parser.add_mutually_exclusive_group(required=True)
     meta.add_argument("--projection-meta-path")
@@ -656,6 +907,9 @@ def parse_args():
     parser.add_argument("--range-max", type=float, default=80.0)
     parser.add_argument("--boundary-log-thr", type=float, default=0.2)
     parser.add_argument("--boundary-radius", type=int, default=1)
+    parser.add_argument(
+        "--correction-tol", type=float, default=DEFAULT_CORRECTION_TOL
+    )
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--neighbor", choices=["angular_grid4", "angular_grid8"], default="angular_grid8")
     parser.add_argument("--edge-spatial-mode", choices=["angular", "tangent"], default="angular")
@@ -670,6 +924,13 @@ def parse_args():
         parser.error("--boundary-log-thr must be nonnegative")
     if args.boundary_radius < 0:
         parser.error("--boundary-radius must be nonnegative")
+    if not math.isfinite(args.correction_tol) or args.correction_tol < 0:
+        parser.error("--correction-tol must be finite and nonnegative")
+    if not args.gdc_label.strip():
+        parser.error("--gdc-label must be non-empty")
+    args.gdc_label = args.gdc_label.strip()
+    if args.gdc_label in {"raw_sdn", "range_gdc"}:
+        parser.error("--gdc-label must not collide with raw_sdn or range_gdc")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     if args.sigma_angular <= 0 or args.sigma_tangent <= 0 or args.sigma_log_range <= 0:

@@ -9,6 +9,17 @@ from tools import analyze_boundary_topology as analysis
 
 class BoundaryTopologyAnalysisTests(unittest.TestCase):
     @staticmethod
+    def activity(raw, method, gt, correction_tol=1e-3):
+        raw = np.asarray(raw, dtype=np.float64)
+        method = np.asarray(method, dtype=np.float64)
+        gt = np.asarray(gt, dtype=np.float64)
+        mask = np.ones(raw.shape, dtype=bool)
+        metrics, _ = analysis.correction_activity_metrics(
+            method, gt, raw, mask, correction_tol=correction_tol
+        )
+        return metrics
+
+    @staticmethod
     def graph_args(**overrides):
         values = {
             "range_min": 0.1,
@@ -155,6 +166,173 @@ class BoundaryTopologyAnalysisTests(unittest.TestCase):
         self.assertEqual(row["status"], analysis.GDC_UNSUPPORTED_STATUS)
         self.assertEqual(row["mapping_ratio"], 0.0)
         self.assertTrue(math.isnan(row["normalized_cross_boundary_influence"]))
+
+    def test_raw_activity_semantics(self):
+        metrics = self.activity([11.0, 9.0], [11.0, 9.0], [10.0, 10.0])
+        self.assertEqual(metrics["changed_ratio"], 0.0)
+        self.assertEqual(metrics["unchanged_ratio"], 1.0)
+        self.assertEqual(metrics["improved_ratio"], 0.0)
+        self.assertEqual(metrics["harm_rate"], 0.0)
+        self.assertEqual(metrics["neutral_ratio"], 1.0)
+        self.assertEqual(metrics["mean_abs_correction"], 0.0)
+        self.assertEqual(metrics["median_abs_correction"], 0.0)
+
+    def test_changed_and_improved(self):
+        metrics = self.activity([12.0], [11.0], [10.0])
+        self.assertEqual(metrics["changed_pixels"], 1)
+        self.assertEqual(metrics["improved_pixels"], 1)
+
+    def test_changed_and_harmed(self):
+        metrics = self.activity([11.0], [12.0], [10.0])
+        self.assertEqual(metrics["changed_pixels"], 1)
+        self.assertEqual(metrics["harmed_pixels"], 1)
+
+    def test_changed_and_neutral(self):
+        metrics = self.activity([9.0], [11.0], [10.0])
+        self.assertEqual(metrics["changed_pixels"], 1)
+        self.assertEqual(metrics["neutral_pixels"], 1)
+
+    def test_unchanged_semantics_are_independent_of_error_outcome(self):
+        metrics = self.activity([11.0], [11.0005], [10.0])
+        self.assertEqual(metrics["changed_pixels"], 0)
+        self.assertEqual(metrics["unchanged_pixels"], 1)
+        self.assertEqual(metrics["harmed_pixels"], 1)
+
+    def test_correction_tolerance_boundary_is_strict(self):
+        exact = analysis._correction_activity_from_vectors([1e-3], [0.0])
+        above = analysis._correction_activity_from_vectors(
+            [np.nextafter(1e-3, math.inf)], [0.0]
+        )
+        self.assertEqual(exact["changed_pixels"], 0)
+        self.assertEqual(above["changed_pixels"], 1)
+
+    def test_error_tolerance_boundary_is_neutral(self):
+        values = np.array([
+            -analysis.HARM_TOL,
+            analysis.HARM_TOL,
+            np.nextafter(-analysis.HARM_TOL, -math.inf),
+            np.nextafter(analysis.HARM_TOL, math.inf),
+        ])
+        metrics = analysis._correction_activity_from_vectors(
+            np.ones(4), values
+        )
+        self.assertEqual(metrics["neutral_pixels"], 2)
+        self.assertEqual(metrics["improved_pixels"], 1)
+        self.assertEqual(metrics["harmed_pixels"], 1)
+
+    def test_activity_count_identities(self):
+        metrics = analysis._correction_activity_from_vectors(
+            [0.0, 0.01, -0.02, 0.0005], [0.0, -1.0, 2.0, 0.0]
+        )
+        self.assertEqual(
+            metrics["changed_pixels"] + metrics["unchanged_pixels"],
+            metrics["pixels"],
+        )
+        self.assertEqual(
+            metrics["improved_pixels"]
+            + metrics["harmed_pixels"]
+            + metrics["neutral_pixels"],
+            metrics["pixels"],
+        )
+
+    def test_changed_conditional_identity(self):
+        metrics = analysis._correction_activity_from_vectors(
+            [0.01, -0.02, 0.03, 0.0], [-1.0, 2.0, 0.0, -1.0]
+        )
+        changed_outcomes = (
+            metrics["changed_improved_pixels"]
+            + metrics["changed_harmed_pixels"]
+            + metrics["changed_neutral_pixels"]
+        )
+        self.assertEqual(changed_outcomes, metrics["changed_pixels"])
+        self.assertAlmostEqual(
+            metrics["changed_improvement_rate"]
+            + metrics["changed_harm_rate"]
+            + metrics["changed_neutral_rate"],
+            1.0,
+        )
+
+    def test_net_error_reduction_is_exact(self):
+        metrics = analysis._correction_activity_from_vectors(
+            [1.0, 1.0], [-1.0, 2.0]
+        )
+        self.assertEqual(metrics["total_improvement"], 1.0)
+        self.assertEqual(metrics["total_harm"], 2.0)
+        self.assertEqual(metrics["net_error_reduction"], -1.0)
+        self.assertEqual(metrics["mean_net_error_reduction"], -0.5)
+        self.assertEqual(metrics["improvement_to_harm_ratio"], 0.5)
+
+    def test_changed_only_correction_magnitude(self):
+        metrics = analysis._correction_activity_from_vectors(
+            [0.0, 0.002, -0.004], [0.0, 0.0, 0.0]
+        )
+        self.assertEqual(metrics["mean_abs_correction"], 0.002)
+        self.assertEqual(metrics["mean_abs_correction_changed_only"], 0.003)
+        self.assertEqual(metrics["median_abs_correction_changed_only"], 0.003)
+
+    def test_empty_changed_set_has_nan_conditional_statistics(self):
+        metrics = analysis._correction_activity_from_vectors(
+            [0.0, 0.001], [0.0, 0.0]
+        )
+        self.assertEqual(metrics["changed_pixels"], 0)
+        self.assertTrue(math.isnan(metrics["changed_improvement_rate"]))
+        self.assertTrue(math.isnan(metrics["changed_harm_rate"]))
+        self.assertTrue(math.isnan(metrics["mean_abs_correction_changed_only"]))
+        self.assertTrue(math.isnan(metrics["median_abs_correction_changed_only"]))
+
+    def test_source_row_exclusion_applies_to_activity(self):
+        raw = np.full((3, 4), 10.0)
+        method = raw.copy()
+        method[1] += 1.0
+        common = analysis.common_hidden_valid_mask(raw, [raw, method, raw], [1])
+        metrics, _ = analysis.correction_activity_metrics(
+            method, raw, raw, common
+        )
+        self.assertEqual(metrics["pixels"], 8)
+        self.assertEqual(metrics["changed_pixels"], 0)
+
+    def test_boundary_and_interior_activity_are_separate(self):
+        gt = np.full((1, 16), 10.0)
+        gt[:, 6:10] = 20.0
+        raw = gt.copy()
+        boundary = analysis.gt_boundary_mask(gt)
+        distance = analysis.periodic_boundary_distance(boundary)
+        common = np.ones(gt.shape, dtype=bool)
+        boundary_region = analysis.region_mask(common, distance, "boundary", 1)
+        interior_region = analysis.region_mask(common, distance, "interior", 1)
+        method = raw.copy()
+        method[boundary_region] += 0.1
+        boundary_metrics, _ = analysis.correction_activity_metrics(
+            method, gt, raw, boundary_region
+        )
+        interior_metrics, _ = analysis.correction_activity_metrics(
+            method, gt, raw, interior_region
+        )
+        self.assertEqual(
+            boundary_metrics["changed_pixels"], int(boundary_region.sum())
+        )
+        self.assertEqual(interior_metrics["changed_pixels"], 0)
+
+    def test_activity_analysis_is_deterministic(self):
+        arguments = ([0.0, 0.002, -0.003], [-1.0, 0.0, 2.0])
+        first = analysis._correction_activity_from_vectors(*arguments)
+        second = analysis._correction_activity_from_vectors(*arguments)
+        for key in first:
+            if math.isnan(first[key]):
+                self.assertTrue(math.isnan(second[key]))
+            else:
+                self.assertEqual(first[key], second[key])
+
+    def test_invalid_activity_tolerances_fail_fast(self):
+        for correction_tol in (-1.0, math.inf, math.nan):
+            with self.assertRaises(ValueError):
+                analysis._correction_activity_from_vectors(
+                    [0.0], [0.0], correction_tol=correction_tol
+                )
+        with self.assertRaises(ValueError):
+            analysis._correction_activity_from_vectors(
+                [0.0], [0.0], error_tol=-1.0
+            )
 
 
 if __name__ == "__main__":
