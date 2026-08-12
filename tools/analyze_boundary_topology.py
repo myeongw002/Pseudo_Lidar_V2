@@ -588,6 +588,12 @@ def resolve_projection_meta(args):
             "azimuth_mode": str(meta["azimuth_mode"].item()) if "azimuth_mode" in meta.files else "full_360_front_centered",
             "selected_rows": meta["selected_rows"].astype(np.int64).tolist() if "selected_rows" in meta.files else None,
         }
+        for name in (
+            "vmin_deg", "vmax_deg", "azimuth_min_deg", "azimuth_max_deg",
+            "vertical_resolution_deg", "horizontal_resolution_deg",
+        ):
+            if name in meta.files:
+                projection[name] = float(meta[name].item())
     projection["shape"] = (
         len(projection["vertical_centers_deg"]), len(projection["azimuth_centers_deg"])
     )

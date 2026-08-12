@@ -2,7 +2,7 @@
 set -euo pipefail
 IMAGE_NAME=${IMAGE_NAME:-pseudo-lidar-v2:cu128}
 REPO_DIR=${REPO_DIR:-$PWD/..}
-KITTI_DIR=${KITTI_DIR:-$PWD/data/KITTI}
+KITTI_DIR=${KITTI_DIR:-/media/myungw00/2TB_SSD/kitti}
 SCENEFLOW_DIR=${SCENEFLOW_DIR:-$PWD/data/SceneFlow}
 RESULTS_DIR=${RESULTS_DIR:-$PWD/results}
 mkdir -p "$RESULTS_DIR"
