@@ -9,6 +9,7 @@ ANCHOR_REJECT_MODES = {"log_ratio", "abs", "none"}
 NEIGHBOR_MODES = {"angular_grid4", "angular_grid8"}
 EDGE_SPATIAL_MODES = {"angular", "tangent"}
 EDGE_RANGE_MODES = {"log_gaussian", "uniform"}
+RESIDUAL_DOMAINS = {"log", "linear"}
 
 
 def valid_range_mask(range_img, range_min=0.1, range_max=80.0):
@@ -379,13 +380,14 @@ def RangeROIGDC(
     sigma_log_range=0.3,
     max_log_range_diff=None,
     edge_range_mode="log_gaussian",
+    residual_domain="log",
     delta_clip=0.3,
     anchor_force_policy="accepted_only",
     return_debug=False,
     return_stats=False,
     verbose=False,
 ):
-    """Graph-regularized log-range residual correction on guide-valid bins."""
+    """Graph-regularized log- or linear-range residual correction."""
     del verbose
     t0 = time.perf_counter()
     guide_range = np.asarray(pred_range, dtype=np.float32)
@@ -399,6 +401,11 @@ def RangeROIGDC(
             f"edge_range_mode must be one of {sorted(EDGE_RANGE_MODES)}, "
             f"got {edge_range_mode!r}"
         )
+    if residual_domain not in RESIDUAL_DOMAINS:
+        raise ValueError(
+            f"residual_domain must be one of {sorted(RESIDUAL_DOMAINS)}, "
+            f"got {residual_domain!r}"
+        )
     if delta_clip is not None and delta_clip <= 0:
         raise ValueError("delta_clip must be positive when set")
     if anchor_force_policy not in {"accepted_only", "all_valid", "none"}:
@@ -408,7 +415,8 @@ def RangeROIGDC(
 
     H, W_img = guide_range.shape
     stats = {
-        "method_tag": "graph_log_range_residual",
+        "method_tag": f"graph_{residual_domain}_range_residual",
+        "residual_domain": residual_domain,
         "status": "ok",
         "H": H,
         "W": W_img,
@@ -519,11 +527,15 @@ def RangeROIGDC(
             result = (*result, debug)
         return result if return_stats else (corrected_range, output_mask)
 
-    raw_log = np.log(np.maximum(guide_range.astype(np.float64), 1e-6))
-    anchor_log = np.log(np.maximum(anchor_range.astype(np.float64), 1e-6))
-    raw_log_nodes = raw_log[guide_valid]
+    if residual_domain == "log":
+        raw_base = np.log(np.maximum(guide_range.astype(np.float64), 1e-6))
+        anchor_base = np.log(np.maximum(anchor_range.astype(np.float64), 1e-6))
+    else:
+        raw_base = guide_range.astype(np.float64)
+        anchor_base = anchor_range.astype(np.float64)
+    raw_base_nodes = raw_base[guide_valid]
     target_node_indices = node_id[target_mask]
-    target_delta_map = anchor_log - raw_log
+    target_delta_map = anchor_base - raw_base
     target_delta = target_delta_map[target_mask]
     if delta_clip is not None:
         target_delta = np.clip(target_delta, -float(delta_clip), float(delta_clip))
@@ -565,7 +577,10 @@ def RangeROIGDC(
     stats["propagation_ratio_graph"] = float(
         stats["delta_graph_abs_mean"] / max(stats["residual_target_abs_mean"], 1e-12)
     ) if np.isfinite(stats["delta_graph_abs_mean"]) and np.isfinite(stats["residual_target_abs_mean"]) else np.nan
-    graph_node_values = np.exp(raw_log_nodes + delta_graph).astype(np.float32)
+    if residual_domain == "log":
+        graph_node_values = np.exp(raw_base_nodes + delta_graph).astype(np.float32)
+    else:
+        graph_node_values = (raw_base_nodes + delta_graph).astype(np.float32)
     corrected_graph_solve = guide_range.copy()
     corrected_graph_solve[guide_valid] = np.clip(graph_node_values, range_min, range_max)
     graph_solve_err = corrected_graph_solve[target_mask] - anchor_range[target_mask]
@@ -581,7 +596,10 @@ def RangeROIGDC(
     stats.update(_vector_stats(delta_final, "delta_final"))
 
     corrected_before_force = guide_range.copy()
-    final_node_values = np.exp(raw_log_nodes + delta_final).astype(np.float32)
+    if residual_domain == "log":
+        final_node_values = np.exp(raw_base_nodes + delta_final).astype(np.float32)
+    else:
+        final_node_values = (raw_base_nodes + delta_final).astype(np.float32)
     final_node_values = np.clip(final_node_values, range_min, range_max)
     corrected_before_force[guide_valid] = final_node_values
     graph_err = corrected_before_force[target_mask] - anchor_range[target_mask]

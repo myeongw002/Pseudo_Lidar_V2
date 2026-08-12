@@ -40,6 +40,7 @@ STATS_FIELDNAMES = [
     "output_valid_count",
     "output_valid_ratio",
     "method_tag",
+    "residual_domain",
     "delta_graph_mean",
     "delta_graph_std",
     "delta_graph_abs_mean",
@@ -274,6 +275,7 @@ def process_one(task):
         sigma_log_range=args_dict["sigma_log_range"],
         max_log_range_diff=args_dict["max_log_range_diff"],
         edge_range_mode=args_dict["edge_range_mode"],
+        residual_domain=args_dict["residual_domain"],
         delta_clip=args_dict["delta_clip"],
         anchor_force_policy=args_dict["anchor_force_policy"],
         return_stats=True,
@@ -333,11 +335,18 @@ def parse_args(argv=None):
         choices=["log_gaussian", "uniform"],
         default="log_gaussian",
     )
+    parser.add_argument(
+        "--residual_domain", choices=["log", "linear"], default="log"
+    )
     parser.add_argument("--sigma_angular", type=float, default=0.01)
     parser.add_argument("--sigma_tangent", type=float, default=1.0)
     parser.add_argument("--sigma_log_range", type=float, default=0.3)
     parser.add_argument("--max_log_range_diff", type=float, default=None)
     parser.add_argument("--delta_clip", type=float, default=0.3)
+    parser.add_argument(
+        "--disable_delta_clip", action="store_const", const=None,
+        dest="delta_clip",
+    )
     parser.add_argument(
         "--anchor_force_policy",
         choices=["accepted_only", "all_valid", "none"],
@@ -426,6 +435,8 @@ def main():
     print(f"neighbor          : {args.neighbor}")
     print(f"edge_spatial_mode : {args.edge_spatial_mode}")
     print(f"edge_range_mode   : {args.edge_range_mode}")
+    print(f"residual_domain   : {args.residual_domain}")
+    print(f"delta_clip        : {args.delta_clip}")
     print(f"threads           : {args.threads}")
 
     stats_rows = []
