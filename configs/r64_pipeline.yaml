@@ -5,7 +5,7 @@ split_file: ./split/val.txt
 threads: 4
 data_tag: canonical
 sdn_config: ./src/configs/sdn_kitti_train.config
-sdn_checkpoint: /data/kitti/pseudo_lidar/sdn_kitti_train_set/checkpoint.pth.tar
+sdn_checkpoint: /data/kitti/pseudo_lidar/sdn_kitti_train_set/model_best.pth.tar
 
 anchor:
   mode: shared_canonical
